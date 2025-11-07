@@ -1,0 +1,85 @@
+# Bolt CEP Project Rules
+
+## Architecture Overview
+
+This is a Bolt CEP project for Adobe CEP extensions. It has two main layers:
+
+1. **CEP JavaScript Layer** (`src/js/`) - React UI running in CEP panel
+2. **ExtendScript Layer** (`src/jsx/`) - Adobe app scripting (Premiere Pro)
+
+## Frontend Framework
+
+- **React** is used for the UI layer
+  - Components are written in TypeScript (`.tsx` files)
+  - React hooks (`useState`, `useEffect`, etc.) are available
+  - Entry point for each panel: `src/js/main/index.tsx`
+  - Use functional components with hooks (no class components)
+  - React 19 is used (check `package.json` for version)
+
+## Package Manager
+
+- **Always use Yarn** for package management
+  - Install dependencies: `yarn install` or `yarn`
+  - Add packages: `yarn add <package>` or `yarn add -D <package>` for dev dependencies
+  - Run scripts: `yarn dev`, `yarn build`, `yarn zxp`, etc.
+
+## Styling
+
+- **Tailwind CSS** is used for styling
+  - Tailwind directives are imported in `src/js/index.scss`
+  - Configuration: `tailwind.config.js` (content paths: `./src/js/**/*.{html,js,ts,tsx}`)
+  - PostCSS configuration: `postcss.config.js` handles Tailwind processing
+  - Use utility classes directly in JSX/TSX components
+  - Custom styles can be added in component-specific `.scss` files or via Tailwind's `@apply` directive
+
+## Key Patterns
+
+### Communication Between Layers
+
+- **CEP → ExtendScript**: Use `evalTS()` for type-safe function calls
+
+  ```typescript
+  import { evalTS } from "../lib/utils/bolt";
+  evalTS("functionName", arg1, arg2).then((result) => { ... });
+  ```
+
+- **ExtendScript → CEP**: Use `dispatchTS()` and `listenTS()` for events
+  - Define event types in `src/shared/universals.d.ts`
+  - Listen in CEP: `listenTS("eventName", (data) => { ... })`
+  - Dispatch from ExtendScript: `dispatchTS("eventName", data)`
+
+### ExtendScript Functions
+
+- Functions must be exported from app-specific modules (`src/jsx/ppro/ppro.ts` for Premiere Pro)
+- Functions are automatically namespaced via `src/shared/shared.ts`
+- All ExtendScript functions are available via `evalTS()` with full type safety
+
+### Project Structure
+
+- Each panel has its own folder: `src/js/main/` (contains `index.html` and `index.tsx`)
+- App-specific ExtendScript code: `src/jsx/ppro/` for Premiere Pro
+- Shared utilities: `src/shared/`
+- Configuration: `cep.config.ts`
+
+## Type Safety
+
+- ExtendScript functions are type-checked via `Scripts` type in `src/jsx/index.ts`
+- `evalTS()` provides end-to-end type safety between CEP and ExtendScript
+- Use `types-for-adobe` for Adobe API types
+
+## Build System
+
+- Vite handles CEP JavaScript layer compilation
+- ExtendScript is compiled to ES3 via `vite.es.config.ts`
+- Build outputs to `dist/cep/`
+- Development server runs on port 3000 (configurable in `cep.config.ts`)
+- Tailwind CSS is processed via PostCSS during the Vite build
+
+## Common Tasks
+
+- Adding new ExtendScript functions: Export from `src/jsx/ppro/ppro.ts`
+- Adding new panels: Add entry to `cep.config.ts` panels array and create folder structure
+- Adding host apps: Update `cep.config.ts` hosts array and add app module in `src/jsx/`
+- Adding new dependencies: Use `yarn add <package>` (not npm)
+- Creating React components: Add `.tsx` files in `src/js/` directories, use functional components with hooks
+- Styling components: Use Tailwind utility classes, or add custom SCSS files alongside components

@@ -1,0 +1,114 @@
+{
+  "aelibCompliantVersion": "0",
+  "apiVersion": "2.1",
+  "authorApp": "ppro",
+  "authorID": "",
+  "capsuleID": "1564c873-88bc-4ba0-b0a5-ebe232c92b16",
+  "capsuleName": "FaceBlurTest",
+  "capsuleNameLocalized": {
+    "strDB": [{ "localeString": "en_US", "str": "FaceBlurTest" }]
+  },
+  "capsuleTags": [],
+  "clientControls": [
+    {
+      "canAnimate": false,
+      "hidden": true,
+      "id": "4",
+      "type": 8,
+      "uiName": { "strDB": [{ "localeString": "en_US", "str": "LayerName" }] },
+      "uiSuffix": { "strDB": [{ "localeString": "en_US", "str": "" }] },
+      "uiToolTip": { "strDB": [{ "localeString": "en_US", "str": "" }] },
+      "value": { "strDB": [{ "localeString": "en_US", "str": "Shape" }] }
+    }
+  ],
+  "description": "",
+  "internalEffectsOnlyVersion": "201904",
+  "licenseID": "d57ffd08-a160-4c42-a5ad-4549b06d9b61",
+  "mobileCompatibilityVersion": "0",
+  "platformSupport": [],
+  "responsiveDesignVersion": "0",
+  "sourceInfoLocalized": {
+    "en_US": {
+      "alphachanneltype": 1,
+      "alphamattecolorb": 0,
+      "alphamattecolorg": 0,
+      "alphamattecolorr": 0,
+      "anywhereassetrequestinfo": {
+        "mAssetInfo": {
+          "mAssetIdentifier": "",
+          "mProductionIdentifier": "",
+          "mProductionRevision": ""
+        },
+        "mServerConnectInfo": {
+          "mAuthToken": "",
+          "mEARPort": "",
+          "mUserName": ""
+        }
+      },
+      "anywhereproductionrequestinfo": {
+        "mProductionInfo": {
+          "mDisplayName": "",
+          "mProductionIdentifier": "",
+          "mRevision": ""
+        },
+        "mServerConnectInfo": {
+          "mAuthToken": "",
+          "mEARPort": "",
+          "mUserName": ""
+        }
+      },
+      "appspecificsourceinfo": "",
+      "audiochannellayout": [],
+      "audiosamplerate": { "ticksperframe": 9223372036854775807 },
+      "capsuleparams": { "capParams": [] },
+      "colorAwareEffectsEnabled": 0,
+      "colorSpace": {
+        "baseColorProfile": { "colorProfileName": "BT.709 RGB Full" },
+        "baseProfileType": 1
+      },
+      "contentcredentialsinfo": "",
+      "currenttime": { "scale": 1, "value": 0 },
+      "duration": { "scale": 1, "value": 5 },
+      "enableLogColorManagement": false,
+      "fieldtype": 0,
+      "framerate": { "ticksperframe": 10584000000 },
+      "framesize": {
+        "size": { "x": 1280, "y": 720 },
+        "topleft": { "x": 0, "y": 0 }
+      },
+      "graphicsWhiteLuminance": 100,
+      "hasFrozenUnstretchableRegions": false,
+      "hasaudio": false,
+      "hasvideo": true,
+      "id": "5b1bde25-1c93-4467-af94-f6ba0b64c304",
+      "initialcontentstate": "00000000-0000-0000-0000-000000000000",
+      "inpoint": { "scale": 1, "value": -400000 },
+      "isdropframe": true,
+      "ismedia": false,
+      "isxmpwritable": false,
+      "mediaproducerdescription": "",
+      "missingassets": {
+        "missAssetsPropMissingFonts": [],
+        "missAssetsPropMissingFootage": [],
+        "missAssetsPropMissingPlugins": []
+      },
+      "name": "",
+      "nativefieldtype": 4,
+      "outpoint": { "scale": 1, "value": -400000 },
+      "parentprojectfile": "",
+      "pixelaspectratio": { "denominator": 1, "numerator": 1 },
+      "pixelformatlist": [],
+      "sourceBitrate": 0,
+      "starttime": { "scale": 1, "value": 0 },
+      "supportsvideorenderingsessions": false,
+      "teamProjectName": "",
+      "workinpoint": { "scale": 1, "value": -400000 },
+      "workoutpoint": { "scale": 1, "value": -400000 }
+    }
+  },
+  "typekitOnlyVersion": "typekitOnlyVersion",
+  "usedCompRenderers": [],
+  "usedEffects": [],
+  "usedFileTypes": [],
+  "usedFontsLocalized": { "en_US": [] }
+}
