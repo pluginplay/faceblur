@@ -96,8 +96,10 @@ export const timecodeToTicks = (timecode: string, frameRate: number) => {
   const frames = parseInt(segments[3]);
   const totalSeconds =
     hours * 3600 + minutes * 60 + seconds + frames / frameRate;
-  const ticks = totalSeconds * 10000000; // 1 second = 10,000,000 ticks
-  return Math.round(ticks);
+  const time = new Time();
+  time.seconds = totalSeconds;
+
+  return time.ticks;
 };
 
 export const secondsToTime = (seconds: number) => {

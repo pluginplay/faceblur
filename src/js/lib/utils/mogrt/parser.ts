@@ -170,3 +170,159 @@ export const parseMogrtXmlMaskPath = (xmlPath: string): MogrtMaskPathResult => {
     }
   }
 };
+
+/**
+ * Finds all Gaussian Blur components and their associated AE Mask components and key params.
+ * Returns tuples for convenient bulk updates.
+ */
+export const findGaussianBlurMaskTuples = (
+  doc: Document
+): Array<{
+  blurComponent: Element;
+  maskComponent: Element;
+  maskPathParam: Element | null;
+  blurrinessParam: Element | null;
+  maskFeatherParam: Element | null;
+  maskExpansionParam: Element | null;
+}> => {
+  const tuples: Array<{
+    blurComponent: Element;
+    maskComponent: Element;
+    maskPathParam: Element | null;
+    blurrinessParam: Element | null;
+    maskFeatherParam: Element | null;
+    maskExpansionParam: Element | null;
+  }> = [];
+
+  const allVideoFilterComponents = Array.from(
+    doc.querySelectorAll("VideoFilterComponent")
+  );
+
+  const findByObjectId = (id: string): Element | null => {
+    return (
+      doc.querySelector(`*[ObjectID="${id}"]`) ||
+      doc.querySelector(`*[ObjectUID="${id}"]`)
+    );
+  };
+
+  const getParamsForComponent = (
+    component: Element
+  ): Element[] => {
+    const params = component.querySelectorAll("Component > Params > Param");
+    const refs: Element[] = [];
+    params.forEach((p) => {
+      const ref = p.getAttribute("ObjectRef");
+      if (ref) {
+        const node = findByObjectId(ref);
+        if (node) refs.push(node);
+      }
+    });
+    return refs;
+  };
+
+  const getSubComponentRefs = (component: Element): string[] => {
+    const subs = component.querySelectorAll(
+      "SubComponents > SubComponent[ObjectRef]"
+    );
+    const ids: string[] = [];
+    subs.forEach((s) => {
+      const ref = s.getAttribute("ObjectRef");
+      if (ref) ids.push(ref);
+    });
+    return ids;
+  };
+
+  allVideoFilterComponents.forEach((vf) => {
+    const matchName = vf.querySelector("MatchName")?.textContent?.trim();
+    if (matchName !== "AE.ADBE Gaussian Blur 2") return;
+
+    // Find mask component via SubComponents
+    const subRefs = getSubComponentRefs(vf);
+    let maskComp: Element | null = null;
+    for (const ref of subRefs) {
+      const cand = findByObjectId(ref);
+      const candMatch = cand?.querySelector("MatchName")?.textContent?.trim();
+      if (cand && cand.tagName === "VideoFilterComponent" && candMatch === "AE.ADBE AEMask") {
+        maskComp = cand;
+        break;
+      }
+    }
+    if (!maskComp) return;
+
+    // Pull referenced params
+    const blurParams = getParamsForComponent(vf);
+    const maskParams = getParamsForComponent(maskComp);
+
+    const blurrinessParam =
+      blurParams.find(
+        (e) =>
+          e.tagName === "VideoComponentParam" &&
+          e.querySelector("Name")?.textContent?.trim() === "Blurriness"
+      ) || null;
+
+    const maskPathParam =
+      maskParams.find(
+        (e) =>
+          e.tagName === "ArbVideoComponentParam" &&
+          e.querySelector("Name")?.textContent?.trim() === "Mask Path"
+      ) || null;
+
+    const maskFeatherParam =
+      maskParams.find(
+        (e) =>
+          e.tagName === "VideoComponentParam" &&
+          e.querySelector("Name")?.textContent?.trim() === "Mask Feather"
+      ) || null;
+
+    const maskExpansionParam =
+      maskParams.find(
+        (e) =>
+          e.tagName === "VideoComponentParam" &&
+          e.querySelector("Name")?.textContent?.trim() === "Mask Expansion"
+      ) || null;
+
+    tuples.push({
+      blurComponent: vf,
+      maskComponent: maskComp,
+      maskPathParam,
+      blurrinessParam,
+      maskFeatherParam,
+      maskExpansionParam,
+    });
+  });
+
+  return tuples;
+};
+
+/**
+ * Collect all used numeric ObjectID values in the document for ID allocation.
+ */
+export const collectUsedObjectIds = (doc: Document): Set<number> => {
+  const used = new Set<number>();
+  const all = doc.querySelectorAll("*[ObjectID]");
+  all.forEach((el) => {
+    const v = el.getAttribute("ObjectID");
+    if (v && /^[0-9]+$/.test(v)) {
+      used.add(parseInt(v, 10));
+    }
+  });
+  return used;
+};
+
+/**
+ * Returns a function that produces monotonically increasing unique ObjectIDs.
+ */
+export const makeObjectIdAllocator = (used: Set<number>): (() => number) => {
+  let max = 0;
+  used.forEach((n) => {
+    if (n > max) max = n;
+  });
+  let next = max + 1;
+  return () => {
+    while (used.has(next)) {
+      next++;
+    }
+    used.add(next);
+    return next;
+  };
+};

@@ -9,17 +9,14 @@ export interface MaskPoint {
   outTangentY?: number;
 }
 
-export interface SquareBounds {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-}
-
 /**
  * Writes a 32-bit float to a buffer at the given offset (little-endian)
  */
-const writeFloat32LE = (buffer: Uint8Array, offset: number, value: number): void => {
+const writeFloat32LE = (
+  buffer: Uint8Array,
+  offset: number,
+  value: number
+): void => {
   const view = new DataView(buffer.buffer, buffer.byteOffset + offset, 4);
   view.setFloat32(0, value, true); // true = little-endian
 };
@@ -27,56 +24,13 @@ const writeFloat32LE = (buffer: Uint8Array, offset: number, value: number): void
 /**
  * Writes a 32-bit integer to a buffer at the given offset (little-endian)
  */
-const writeInt32LE = (buffer: Uint8Array, offset: number, value: number): void => {
+const writeInt32LE = (
+  buffer: Uint8Array,
+  offset: number,
+  value: number
+): void => {
   const view = new DataView(buffer.buffer, buffer.byteOffset + offset, 4);
   view.setInt32(0, value, true); // true = little-endian
-};
-
-/**
- * Creates a simple 4-point square mask path in normalized coordinates (0-1 range)
- * Accounts for aspect ratio to create a true square (not stretched rectangle)
- * @param bounds Optional bounds for the square. If not provided, creates a centered square
- * @param aspectRatio Optional aspect ratio (width/height). Defaults to 16/9 (1280x720)
- * @returns Array of 4 points: top-left, top-right, bottom-right, bottom-left
- */
-export const createSquareMaskPath = (
-  bounds?: Partial<SquareBounds>,
-  aspectRatio: number = 16 / 9
-): MaskPoint[] => {
-  if (bounds) {
-    // Use provided bounds directly
-    return [
-      { x: bounds.left!, y: bounds.top! }, // top-left
-      { x: bounds.right!, y: bounds.top! }, // top-right
-      { x: bounds.right!, y: bounds.bottom! }, // bottom-right
-      { x: bounds.left!, y: bounds.bottom! }, // bottom-left
-    ];
-  }
-
-  // Create a centered square that accounts for aspect ratio
-  // For a square in a 16:9 frame, we need to adjust X coordinates
-  // to compensate for the wider aspect ratio
-  
-  // Use 50% of the frame height for the square size
-  const squareHeight = 0.5; // normalized (0.25 to 0.75 = 0.5 height)
-  const top = 0.25;
-  const bottom = 0.75;
-  
-  // To maintain square aspect ratio, X span must be adjusted by aspect ratio
-  // If frame is wider (aspectRatio > 1), X span must be smaller
-  const squareWidth = squareHeight / aspectRatio; // Normalized width for square
-  
-  // Center horizontally
-  const left = (1 - squareWidth) / 2;
-  const right = (1 + squareWidth) / 2;
-
-  // Return 4 points forming a square: top-left, top-right, bottom-right, bottom-left
-  return [
-    { x: left, y: top }, // top-left
-    { x: right, y: top }, // top-right
-    { x: right, y: bottom }, // bottom-right
-    { x: left, y: bottom }, // bottom-left
-  ];
 };
 
 /**
@@ -96,25 +50,25 @@ export const createPentagonMaskPath = (
 ): MaskPoint[] => {
   const points: MaskPoint[] = [];
   const numPoints = 5;
-  
+
   // Adjust size for aspect ratio to maintain regular shape
   const adjustedSize = size / aspectRatio;
-  
+
   // Calculate pentagon vertices
   // Start from top point and go clockwise
   for (let i = 0; i < numPoints; i++) {
     // Angle for each vertex (pentagon: 72 degrees between points)
     // Start at -90 degrees (top) and rotate clockwise
     const angle = (-90 + (i * 360) / numPoints) * (Math.PI / 180);
-    
+
     // Calculate x and y coordinates
     // Adjust x by aspect ratio to maintain regular shape
     const x = centerX + adjustedSize * Math.cos(angle);
     const y = centerY + size * Math.sin(angle);
-    
+
     points.push({ x, y });
   }
-  
+
   return points;
 };
 
@@ -209,3 +163,44 @@ export const encodeMaskPathToBase64 = (points: MaskPoint[]): string => {
   return buffer.toString("base64");
 };
 
+/**
+ * Converts canvas coordinates to normalized coordinates (0-1 range)
+ * @param x Canvas X coordinate
+ * @param y Canvas Y coordinate
+ * @param imageWidth Image width in pixels
+ * @param imageHeight Image height in pixels
+ * @returns Normalized coordinates { x, y } in 0-1 range
+ */
+export const canvasToNormalized = (
+  x: number,
+  y: number,
+  imageWidth: number,
+  imageHeight: number
+): { x: number; y: number } => {
+  const normalizedX = Math.max(0, Math.min(1, x / imageWidth));
+  const normalizedY = Math.max(0, Math.min(1, y / imageHeight));
+  return { x: normalizedX, y: normalizedY };
+};
+
+/**
+ * Creates a test box (rectangle) at specific normalized coordinates
+ * Useful for debugging coordinate transformation between panel and Premiere
+ * @param x1 Top-left X coordinate (normalized 0-1)
+ * @param y1 Top-left Y coordinate (normalized 0-1)
+ * @param x2 Bottom-right X coordinate (normalized 0-1)
+ * @param y2 Bottom-right Y coordinate (normalized 0-1)
+ * @returns Array of 4 points forming a rectangle (top-left, top-right, bottom-right, bottom-left)
+ */
+export const createTestBox = (
+  x1: number = 0.1,
+  y1: number = 0.1,
+  x2: number = 0.9,
+  y2: number = 0.9
+): MaskPoint[] => {
+  return [
+    { x: x1, y: y1 }, // Top-left
+    { x: x2, y: y1 }, // Top-right
+    { x: x2, y: y2 }, // Bottom-right
+    { x: x1, y: y2 }, // Bottom-left
+  ];
+};

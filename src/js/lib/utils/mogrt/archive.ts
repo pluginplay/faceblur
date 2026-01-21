@@ -13,7 +13,7 @@ export const createZipBuffer = async (
 ): Promise<Buffer> => {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    const archiver = require("archiver") as typeof import("archiver");
+    const archiver = require("archiver");
     const archive: Archiver = archiver("zip", {
       forceZip64: options?.forceZip64 ?? false, // Disable ZIP64
       zlib: { level: options?.zlibLevel ?? 9 }, // Maximum compression
