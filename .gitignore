@@ -10,6 +10,7 @@ yarn-error.log
 # Face pipeline dev outputs (do not commit)
 # -----------------------------------------------------------------------------
 _generated/
+.tmp/
 tracking_output.json
 pipeline_output.txt
 raw_tracking_data.json

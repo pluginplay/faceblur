@@ -1,0 +1,97 @@
+---
+description: Face detection C++ pipeline and testing workflow
+alwaysApply: true
+---
+
+# Face Blur Pipeline
+
+## Overview
+
+Adobe CEP extension for Premiere Pro with a native C++ face detection/tracking pipeline.
+
+**Architecture:**
+
+- `cpp/` - C++ face pipeline (SCRFD + OC-SORT)
+- `src/js/` - React UI (CEP panel)
+- `src/jsx/` - ExtendScript (Premiere Pro)
+- `scripts/` - Python testing utilities
+- `src/bin/` - Bundled executable + models
+
+## C++ Pipeline
+
+Uses **ncnn** for SCRFD face detection and **OC-SORT** (Kalman filter) for tracking.
+
+**Key files:**
+
+- `cpp/src/main.cpp` - CLI entry point
+- `cpp/src/scrfd.cpp` - Face detection (SCRFD model)
+- `cpp/src/ocsort.cpp` - Multi-object tracker
+- `cpp/src/pipeline.cpp` - Detection + tracking integration
+
+**CLI modes:**
+
+```bash
+# Single image detection
+./face_pipeline --model <dir> --image <path>
+
+# Multi-frame tracking (paths via stdin)
+./face_pipeline --model <dir> --track --video-fps 30 --detection-fps 5
+```
+
+**Output:** JSON with tracks containing normalized bboxes (0-1 coords).
+
+## Building C++
+
+```bash
+# 1. Build ncnn first (one-time)
+cd cpp/third_party/ncnn-master
+mkdir -p build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=./install
+make -j4 && make install
+
+# 2. Build face_pipeline
+cd cpp
+mkdir -p build && cd build
+cmake ..
+make -j4
+
+# 3. Install to src/bin (for bundling)
+cmake --install . --prefix ../../src/bin
+```
+
+**Requirements:** CMake 3.20+, C++17 compiler. Builds universal binary on macOS.
+
+## Testing with Python
+
+`scripts/test_face_pipeline.py` - End-to-end test that generates debug videos.
+
+```bash
+# Run test (extracts frames → runs C++ pipeline → renders bboxes)
+python scripts/test_face_pipeline.py --video input.mp4
+
+# With options
+python scripts/test_face_pipeline.py --video input.mp4 \
+  --output output.mp4 \
+  --detection-fps 5 \
+  --conf 0.5 \
+  --iou 0.15
+```
+
+**What it does:**
+
+1. Extracts video frames to temp dir
+2. Calls `src/bin/face_pipeline` with frame paths via stdin
+3. Renders colored bboxes with track IDs onto output video
+
+**Python deps (dev-only):** `pip install -r requirements.txt` (opencv-python, numpy)
+
+## Models
+
+Located in `src/bin/models/`:
+
+- `scrfd.param` - Network architecture
+- `scrfd.bin` - Weights
+
+## Video Analyzer MCP
+
+Use the video analyzer MCP to visually inspect detection results and debug tracking issues without regenerating test videos. You can use it on the original video as well. You can inspect a single frame, the entire video, or a part of the video.
