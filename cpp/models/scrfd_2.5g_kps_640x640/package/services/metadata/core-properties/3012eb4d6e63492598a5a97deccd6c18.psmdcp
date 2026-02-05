@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<coreProperties xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://schemas.openxmlformats.org/package/2006/metadata/core-properties">
+  <dc:creator>Georg Jung</dc:creator>
+  <dc:description>This package provides an SCRFD 2.5G KPS model, downloaded from the official github.com/deepinsight/insightface repository and converted to ONNX. SCRFD is a state-of-the-art face detection model that also provides facial landmarks/facial keypoints.</dc:description>
+  <dc:identifier>FaceAiSharp.Models.Scrfd.2dot5g_kps_640x640</dc:identifier>
+  <version>0.20230205.2</version>
+  <keywords>scrfd insightface face face-detection detection landmarks alignment onnx onnxruntime ai ml model image images artificial-intelligence</keywords>
+  <lastModifiedBy>NuGet.Build.Tasks.Pack, Version=6.5.0.136, Culture=neutral, PublicKeyToken=31bf3856ad364e35;.NET Standard 2.0</lastModifiedBy>
+</coreProperties>

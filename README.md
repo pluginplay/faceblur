@@ -4,8 +4,7 @@ Adobe CEP extension for Premiere Pro that automatically detects faces in video s
 
 ## Features
 
-- **Automatic face detection** using UniFace (Python-based)
-- **Face tracking** across frames with stable track assignment
+- **Automatic face detection + tracking** using a native C++ pipeline (SCRFD + OC-SORT)
 - **Animated blur masks** exported as MOGRT files
 - **Interactive mask editing** with keyframe support
 - **Frame-by-frame preview** with scrubbing and playback
@@ -14,15 +13,14 @@ Adobe CEP extension for Premiere Pro that automatically detects faces in video s
 ## Requirements
 
 - Adobe Premiere Pro
-- Python 3 with UniFace installed: `pip install -r requirements.txt`
 - Node.js and Yarn
+- No Python required to run the extension (Python is optional for dev/test tooling only)
 
 ## Quick Start
 
 1. **Install dependencies:**
    ```bash
    yarn install
-   pip install -r requirements.txt
    ```
 
 2. **Enable PlayerDebugMode** (for unsigned extensions):
@@ -44,6 +42,23 @@ Adobe CEP extension for Premiere Pro that automatically detects faces in video s
    yarn zxp
    ```
 
+## Native face pipeline (C++)
+
+The extension calls a bundled native executable (`face_pipeline`) and reads JSON tracks from stdout.
+
+- **Binary**: `src/bin/face_pipeline` (macOS) and `src/bin/face_pipeline.exe` (Windows)
+- **Models**: `src/bin/models/scrfd.param` and `src/bin/models/scrfd.bin`
+- **Runtime contract**: pass frame paths via stdin, receive `{ tracks, frameCount }` JSON on stdout
+
+## Dev tools (optional): generate a debug video from a source clip
+
+This is only for development/testing. The shipped extension does not use Python.
+
+```bash
+pip install -r requirements.txt
+python scripts/test_face_pipeline.py --video input.mp4 --output _generated/output_faces_debug.mp4
+```
+
 ## Usage
 
 1. Select clips in Premiere Pro timeline
@@ -56,8 +71,8 @@ Adobe CEP extension for Premiere Pro that automatically detects faces in video s
 
 - `src/js/` - CEP JavaScript layer (React UI)
 - `src/jsx/` - ExtendScript layer (Premiere Pro scripting)
-- `scripts/` - Python face detection script
-- `src/bin/` - Extension assets (presets, icons)
+- `scripts/` - Optional Python dev/test utilities (not required at runtime)
+- `src/bin/` - Bundled native pipeline + models (and extension assets)
 - `cep.config.ts` - Extension configuration
 
 ## Documentation

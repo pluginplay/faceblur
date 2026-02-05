@@ -8,29 +8,131 @@ on:
 permissions:
   contents: write
 
-jobs:
-  build:
-    runs-on: windows-latest
+defaults:
+  run:
+    shell: bash
 
-    strategy:
-      matrix:
-        node-version: [18.x]
+jobs:
+  build_native_macos:
+    name: Build native (macOS)
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+      - uses: actions/checkout@v4
         with:
-          node-version: ${{ matrix.node-version }}
-      - run: npm i --legacy-peer-deps
-      - run: npm run zxp
+          submodules: recursive
+
+      - name: Build ncnn (macOS)
+        run: |
+          cmake -S cpp/third_party/ncnn-master -B cpp/third_party/ncnn-master/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=cpp/third_party/ncnn-master/build/install
+          cmake --build cpp/third_party/ncnn-master/build -j 4
+          cmake --install cpp/third_party/ncnn-master/build
+
+      - name: Build face_pipeline (macOS)
+        run: |
+          cmake -S cpp -B cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNCNN_INSTALL_DIR=cpp/third_party/ncnn-master/build/install
+          cmake --build cpp/build -j 4
+
+      - name: Stage native outputs (macOS)
+        run: |
+          rm -rf native_out/macos
+          mkdir -p native_out/macos
+          cmake --install cpp/build --prefix native_out/macos
+
+          # Ensure the common dylib names exist (symlinks may not survive artifact zipping)
+          if [[ -f native_out/macos/libncnn.1.0.26.01.21.dylib ]]; then
+            cp -f native_out/macos/libncnn.1.0.26.01.21.dylib native_out/macos/libncnn.1.dylib
+            cp -f native_out/macos/libncnn.1.0.26.01.21.dylib native_out/macos/libncnn.dylib
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-macos
+          path: native_out/macos/**
+
+  build_native_windows:
+    name: Build native (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build ncnn (Windows)
+        run: |
+          cmake -S cpp/third_party/ncnn-master -B cpp/third_party/ncnn-master/build ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INSTALL_PREFIX=cpp\\third_party\\ncnn-master\\build\\install
+          cmake --build cpp/third_party/ncnn-master/build --config Release
+          cmake --install cpp/third_party/ncnn-master/build --config Release
+        shell: cmd
+
+      - name: Build face_pipeline (Windows)
+        run: |
+          cmake -S cpp -B cpp/build ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DNCNN_INSTALL_DIR=cpp\\third_party\\ncnn-master\\build\\install
+          cmake --build cpp/build --config Release
+        shell: cmd
+
+      - name: Stage native outputs (Windows)
+        run: |
+          rmdir /S /Q native_out 2>NUL || exit /B 0
+          mkdir native_out\\windows
+          cmake --install cpp/build --prefix native_out\\windows --config Release
+        shell: cmd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-windows
+          path: native_out/windows/**
+
+  package_zxp:
+    name: Package ZXP (macOS)
+    runs-on: macos-latest
+    needs: [build_native_macos, build_native_windows]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: yarn
+
+      - name: Install JS dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _native
+
+      - name: Place native binaries into src/bin
+        run: |
+          mkdir -p src/bin
+          cp -f _native/native-macos/face_pipeline src/bin/face_pipeline
+          # mac dylibs (if present)
+          if compgen -G "_native/native-macos/libncnn*.dylib" > /dev/null; then
+            cp -f _native/native-macos/libncnn*.dylib src/bin/
+          fi
+          # windows binary + dll
+          cp -f _native/native-windows/face_pipeline.exe src/bin/face_pipeline.exe
+          if [[ -f _native/native-windows/ncnn.dll ]]; then
+            cp -f _native/native-windows/ncnn.dll src/bin/ncnn.dll
+          fi
+
+          chmod +x src/bin/face_pipeline || true
+
+      - name: Build ZXP
+        run: yarn zxp
 
       - name: GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_NAME: ${{ steps.extract_names.outputs.SOURCE_NAME }}
-          SOURCE_BRANCH: ${{ steps.extract_names.outputs.SOURCE_BRANCH }}
-          SOURCE_TAG: ${{ steps.extract_names.outputs.SOURCE_TAG }}
         with:
           files: "./dist/zxp/*"

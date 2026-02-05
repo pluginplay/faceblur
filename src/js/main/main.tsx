@@ -7,9 +7,7 @@ import { canvasToNormalized, type MaskPoint } from "../lib/utils/mogrt/encoder";
 import { fs, os, path } from "../lib/cep/node";
 import {
   bboxToMaskPoints,
-  detectFacesBatch,
-  detectFacesIncremental,
-  assignFacesToTracks,
+  runFacePipeline,
   type FaceTrack,
 } from "../lib/utils/faceDetection";
 
@@ -46,10 +44,6 @@ export const App = () => {
   const [isRendering, setIsRendering] = useState(false);
   const detectAbortRef = useRef<{ cancelled: boolean }>({ cancelled: false });
   const [faceTracks, setFaceTracks] = useState<FaceTrack[] | null>(null);
-  const [detectionProgress, setDetectionProgress] = useState<{
-    processed: number;
-    total: number | null;
-  }>({ processed: 0, total: null });
   const [confidenceThreshold, setConfidenceThreshold] = useState<number>(0.5);
   const [selectionInfo, setSelectionInfo] = useState<{
     startTicks: string;
@@ -164,29 +158,6 @@ export const App = () => {
     }
   }, [currentFrameIndex, framePaths]);
 
-  // Helper to find frame for index (exact match, nearest previous, or earliest)
-  const findFrameForIndex = (
-    frames: Array<{
-      frameIndex: number;
-      bbox: [number, number, number, number];
-    }>,
-    index: number
-  ) => {
-    // exact match
-    let f = frames.find((fr) => fr.frameIndex === index);
-    if (f) return f;
-    // nearest previous
-    let prev = null as null | (typeof frames)[number];
-    for (let i = frames.length - 1; i >= 0; i--) {
-      if (frames[i].frameIndex <= index) {
-        prev = frames[i];
-        break;
-      }
-    }
-    if (prev) return prev;
-    // fallback to earliest
-    return frames.length ? frames[0] : null;
-  };
 
   // Helper to get points for a mask at a given frame index
   const getMaskPointsAtFrame = useCallback(
@@ -356,135 +327,103 @@ export const App = () => {
   const handleLoadAndRenderSequence = async () => {
     try {
       setIsRendering(true);
-      setIsDetectingFaces(true);
       detectAbortRef.current.cancelled = false;
-      setDetectionProgress({ processed: 0, total: null });
       setStatusMessage("Reading selection and setting In/Out…");
 
       const info = await evalTS("getSelectionRangeAndSetInOut");
       if (typeof info === "string") {
         setStatusMessage(info);
         setIsRendering(false);
-        setIsDetectingFaces(false);
         return;
       }
       setSelectionInfo(info);
 
-      // Create a temp folder for this render
+      // Create temp folder for this render
       const tmpRoot = os.tmpdir();
-      const folder = path.join(
-        tmpRoot,
-        `face_blur_seq_${Date.now().toString(36)}`
-      );
+      const folder = path.join(tmpRoot, `face_blur_seq_${Date.now().toString(36)}`);
       if (!fs.existsSync(folder)) {
         fs.mkdirSync(folder);
       }
 
-      // Start face detection in watch mode BEFORE rendering starts
-      // This way detection begins as soon as first frame appears
-      const detectionPromise = detectFacesIncremental(
-        folder,
-        info.numFrames,
-        confidenceThreshold,
-        (frameIndex, result, totalProcessed) => {
-          // Update progress as each frame is detected
-          setDetectionProgress({
-            processed: totalProcessed,
-            total: info.numFrames,
-          });
-          setStatusMessage(
-            `Rendering & detecting faces… ${totalProcessed}/${info.numFrames} frames processed`
-          );
-        },
-        async (allResults) => {
-          // All frames detected - create tracks and update UI
-          if (detectAbortRef.current.cancelled) {
-            setIsDetectingFaces(false);
-            setIsRendering(false);
-            return;
-          }
-
-          const tracks = assignFacesToTracks(allResults);
-          setFaceTracks(tracks);
-
-          // Initialize editable masks from tracks with all keyframes stored
-          const newMasks: UIMask[] = tracks.map((t, idx) => {
-            const keyframes: Record<number, MaskPoint[]> = {};
-            t.frames.forEach((f) => {
-              keyframes[f.frameIndex] = bboxToMaskPoints(f.bbox);
-            });
-
-            let use = t.frames.find((f) => f.frameIndex === currentFrameIndex);
-            if (!use) {
-              use = t.frames[t.frames.length - 1];
-            }
-            const pts = use ? bboxToMaskPoints(use.bbox) : [];
-            return {
-              id: `track_${t.id}`,
-              name: `Person ${idx + 1}`,
-              points: pts,
-              blurriness: 50,
-              feather: 10,
-              expansion: 0,
-              keyframes,
-            };
-          });
-          setMasks(newMasks);
-          setActiveMaskId(newMasks[0]?.id ?? null);
-          setSelectedPointIndex(null);
-
-          setIsDetectingFaces(false);
-          const finalFrameCount =
-            allResults.length > 0 ? allResults.length : framePaths.length;
-          setStatusMessage(
-            `Complete! Rendered ${finalFrameCount} frames. Detected ${tracks.length} face track(s).`
-          );
-        },
-        detectAbortRef.current
-      ).catch((error) => {
-        if (!detectAbortRef.current.cancelled) {
-          setStatusMessage(`Face detection error: ${error.message}`);
-          console.error("Face detection failed:", error);
-          setIsDetectingFaces(false);
-        }
-      });
-
-      // Start rendering (this happens in parallel with detection)
-      setStatusMessage(
-        `Rendering PNG sequence and detecting faces… (0/${info.numFrames} frames detected)`
-      );
-
+      // Render PNG sequence
+      setStatusMessage(`Rendering PNG sequence… (${info.numFrames} frames)`);
       const result = await evalTS("exportSelectionAsImageSequence", folder);
       setIsRendering(false);
 
       if (typeof result === "string") {
         setStatusMessage(result);
-        detectAbortRef.current.cancelled = true;
-        setIsDetectingFaces(false);
         return;
       }
 
-      // Read all .png files
+      // Collect rendered frame paths
       const entries = fs.readdirSync(result.outputDir) as string[];
       const pngs = entries
         .filter((n) => n.toLowerCase().endsWith(".png"))
-        .map((n) => path.join(result.outputDir, n));
-      // Sort by numeric suffix if present
-      pngs.sort((a, b) => {
-        const na = parseInt(a.replace(/[^0-9]/g, "")) || 0;
-        const nb = parseInt(b.replace(/[^0-9]/g, "")) || 0;
-        return na - nb;
-      });
+        .map((n) => path.join(result.outputDir, n))
+        .sort((a, b) => {
+          const na = parseInt(a.replace(/[^0-9]/g, "")) || 0;
+          const nb = parseInt(b.replace(/[^0-9]/g, "")) || 0;
+          return na - nb;
+        });
       setFramePaths(pngs);
       setCurrentFrameIndex(0);
 
-      // Wait for detection to complete
-      await detectionPromise;
+      if (pngs.length === 0) {
+        setStatusMessage("No frames rendered.");
+        return;
+      }
+
+      // Run face detection + tracking pipeline
+      setIsDetectingFaces(true);
+      setStatusMessage(`Detecting faces… (${pngs.length} frames)`);
+
+      const pipelineResult = await runFacePipeline(pngs, {
+        confThresh: confidenceThreshold,
+        videoFps: 30.0,
+        detectionFps: 5.0,
+      });
+
+      if (detectAbortRef.current.cancelled) {
+        setIsDetectingFaces(false);
+        setStatusMessage("Cancelled.");
+        return;
+      }
+
+      setFaceTracks(pipelineResult.tracks);
+
+      // Initialize editable masks from tracks
+      const newMasks: UIMask[] = pipelineResult.tracks.map((t, idx) => {
+        const keyframes: Record<number, MaskPoint[]> = {};
+        t.frames.forEach((f) => {
+          keyframes[f.frameIndex] = bboxToMaskPoints(f.bbox);
+        });
+
+        const use = t.frames.find((f) => f.frameIndex === 0) ?? t.frames[0];
+        const pts = use ? bboxToMaskPoints(use.bbox) : [];
+
+        return {
+          id: `track_${t.id}`,
+          name: `Person ${idx + 1}`,
+          points: pts,
+          blurriness: 50,
+          feather: 10,
+          expansion: 0,
+          keyframes,
+        };
+      });
+
+      setMasks(newMasks);
+      setActiveMaskId(newMasks[0]?.id ?? null);
+      setSelectedPointIndex(null);
+      setIsDetectingFaces(false);
+
+      setStatusMessage(
+        `Complete! ${pngs.length} frames, ${pipelineResult.tracks.length} face track(s).`
+      );
     } catch (e: any) {
       setStatusMessage(`Error: ${e.toString()}`);
       setIsRendering(false);
       setIsDetectingFaces(false);
-      detectAbortRef.current.cancelled = true;
     }
   };
 
@@ -851,38 +790,33 @@ export const App = () => {
     try {
       setIsDetectingFaces(true);
       detectAbortRef.current.cancelled = false;
-      setStatusMessage("Running face detection on sequence…");
-      const results = await detectFacesBatch(
-        framePaths,
-        confidenceThreshold,
-        4,
-        (done, total) => {
-          setStatusMessage(`Detecting faces… ${done}/${total}`);
-        },
-        detectAbortRef.current
-      );
+      setStatusMessage(`Detecting faces… (${framePaths.length} frames)`);
+
+      const pipelineResult = await runFacePipeline(framePaths, {
+        confThresh: confidenceThreshold,
+        videoFps: 30.0,
+        detectionFps: 5.0,
+      });
+
       if (detectAbortRef.current.cancelled) {
         setStatusMessage("Detection cancelled.");
         return;
       }
-      const tracks = assignFacesToTracks(results);
-      setFaceTracks(tracks);
 
-      // Initialize editable masks from tracks with all keyframes stored
-      const newMasks: UIMask[] = tracks.map((t, idx) => {
-        // Store all keyframes from the track
+      setFaceTracks(pipelineResult.tracks);
+
+      // Initialize editable masks from tracks
+      const newMasks: UIMask[] = pipelineResult.tracks.map((t, idx) => {
         const keyframes: Record<number, MaskPoint[]> = {};
         t.frames.forEach((f) => {
           keyframes[f.frameIndex] = bboxToMaskPoints(f.bbox);
         });
 
-        // pick the bbox for the current frame if present, else nearest previous
-        let use = t.frames.find((f) => f.frameIndex === currentFrameIndex);
-        if (!use) {
-          // fallback to last available
-          use = t.frames[t.frames.length - 1];
-        }
+        const use =
+          t.frames.find((f) => f.frameIndex === currentFrameIndex) ??
+          t.frames[t.frames.length - 1];
         const pts = use ? bboxToMaskPoints(use.bbox) : [];
+
         return {
           id: `track_${t.id}`,
           name: `Person ${idx + 1}`,
@@ -893,14 +827,15 @@ export const App = () => {
           keyframes,
         };
       });
+
       setMasks(newMasks);
       setActiveMaskId(newMasks[0]?.id ?? null);
       setSelectedPointIndex(null);
       setStatusMessage(
-        `Detection complete. Tracks: ${tracks.length}. Masks initialized for current frame.`
+        `Detection complete. ${pipelineResult.tracks.length} track(s).`
       );
     } catch (error: any) {
-      setStatusMessage(`Error detecting faces: ${error.message}`);
+      setStatusMessage(`Error: ${error.message}`);
       console.error("Face detection failed:", error);
       setFaceTracks(null);
     } finally {
@@ -1082,9 +1017,11 @@ export const App = () => {
               disabled={isRendering || isDetectingFaces}
               className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50 text-white text-sm font-medium rounded-md transition-colors shadow-sm"
             >
-              {isRendering || isDetectingFaces
-                ? `Rendering & Detecting${detectionProgress.total ? ` (${detectionProgress.processed}/${detectionProgress.total})` : ""}...`
-                : "Render & Detect Faces"}
+              {isRendering
+                ? "Rendering…"
+                : isDetectingFaces
+                  ? "Detecting…"
+                  : "Render & Detect Faces"}
             </button>
             <div className="flex items-center gap-2">
               <label className="text-gray-300 text-xs font-medium whitespace-nowrap">

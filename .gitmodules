@@ -1,0 +1,3 @@
+[submodule "brevidy_ml"]
+	path = brevidy_ml
+	url = git@github.com:pluginplay/brevidy_ml.git

@@ -5,3 +5,25 @@ dist-ssr
 *.local
 yarn-error.log
 .media
+
+# -----------------------------------------------------------------------------
+# Face pipeline dev outputs (do not commit)
+# -----------------------------------------------------------------------------
+_generated/
+tracking_output.json
+pipeline_output.txt
+raw_tracking_data.json
+test_output*.mp4
+*.avi
+/*.mp4
+
+# Python caches
+**/__pycache__/
+*.pyc
+
+# C++ build outputs
+cpp/build/
+cpp/**/build/
+
+# Local external repos / experiments
+cpp/third_party/_external/
