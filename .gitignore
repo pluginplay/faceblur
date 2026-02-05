@@ -28,3 +28,6 @@ cpp/**/build/
 
 # Local external repos / experiments
 cpp/third_party/_external/
+
+# Cursor local config (contains secrets)
+.cursor/mcp.json
