@@ -13,11 +13,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import math
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None  # type: ignore[assignment]
 
 
 # -----------------------------------------------------------------------------
@@ -37,6 +45,10 @@ FACE_COLORS: List[Tuple[int, int, int]] = [
 ]
 
 BORDER_THICKNESS = 2
+LABEL_FONT_SCALE = 0.6
+LABEL_FONT_THICKNESS = 1
+LABEL_SHADOW_OFFSET = (1, 1)
+COLOR_MUTING_FACTOR = 0.28
 
 
 # -----------------------------------------------------------------------------
@@ -50,6 +62,14 @@ def _get_env_float(name: str, default: float) -> float:
     try:
         return float(value)
     except ValueError:
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert arbitrary value to float, or return default on failure."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return default
 
 
@@ -104,25 +124,27 @@ def extract_frames(video_path: str, output_dir: Path) -> Tuple[List[str], float,
 def run_face_pipeline(
     frame_paths: List[str],
     model_dir: str,
-    reid_model_dir: str | None,
+    body_reid_model_dir: str | None,
     video_fps: float,
     detection_fps: float = 10.0,
+    gmc_fps: float = 0.0,
     conf_thresh: float = 0.5,
     iou_thresh: float = 0.15,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[int, Dict[str, float]], Dict[str, float]]:
     """Run the C++ face_pipeline executable and return tracking results.
     
     Args:
         frame_paths: List of frame image paths
-        model_dir: Directory containing scrfd.param and scrfd.bin
-        reid_model_dir: Optional directory containing MobileFaceNet ncnn files
+        model_dir: Root model directory
+        body_reid_model_dir: Optional directory containing OSNet ONNX files
         video_fps: Source video FPS
         detection_fps: Detection sampling rate
+        gmc_fps: GMC sampling rate (0 = follow detection/video fps)
         conf_thresh: Confidence threshold
         iou_thresh: Tracking IoU threshold
     
     Returns:
-        Parsed JSON output with tracks
+        Parsed JSON output, GMC info map, and profile metrics
     """
     script_dir = Path(__file__).parent.parent
     executable_path = script_dir / "src" / "bin" / "face_pipeline"
@@ -137,6 +159,8 @@ def run_face_pipeline(
     cmd = [
         str(executable_path),
         "--model", model_dir,
+        "--person-model-dir", str(Path(model_dir) / "rf_detr_small"),
+        "--face-model-dir", model_dir,
         "--track",
         "--video-fps", str(video_fps),
         "--detection-fps", str(detection_fps),
@@ -144,8 +168,11 @@ def run_face_pipeline(
         "--iou", str(iou_thresh),
     ]
 
-    if reid_model_dir and Path(reid_model_dir).exists():
-        cmd += ["--reid-model", reid_model_dir]
+    if gmc_fps and gmc_fps > 0.0:
+        cmd += ["--gmc-fps", str(gmc_fps)]
+
+    if body_reid_model_dir and Path(body_reid_model_dir).exists():
+        cmd += ["--body-reid-model-dir", body_reid_model_dir]
     
     # Prepare frame paths as input (one per line)
     frame_input = "\n".join(frame_paths).encode("utf-8")
@@ -153,40 +180,38 @@ def run_face_pipeline(
     # Set up environment for dynamic library loading (macOS/Linux)
     env = os.environ.copy()
     executable_dir = str(Path(executable_path).parent)
+    executable_lib_dir = str(Path(executable_path).parent / "lib")
     # Enable a single summary log line from the native pipeline (stderr).
     env["FACE_PIPELINE_LOG_GMC"] = "1"
-    env["FACE_PIPELINE_LOG_REID"] = "1"
-
-    blur_skip = _get_env_float("FACE_PIPELINE_REID_BLUR_SKIP_VAR", 12.0)
-    blur_sharpen = _get_env_float("FACE_PIPELINE_REID_BLUR_SHARPEN_VAR", 50.0)
-    lap_alpha = _get_env_float("FACE_PIPELINE_REID_LAPLACIAN_ALPHA", 0.6)
-    env.setdefault("FACE_PIPELINE_REID_BLUR_SKIP_VAR", str(blur_skip))
-    env.setdefault("FACE_PIPELINE_REID_BLUR_SHARPEN_VAR", str(blur_sharpen))
-    env.setdefault("FACE_PIPELINE_REID_LAPLACIAN_ALPHA", str(lap_alpha))
-    print(
-        "ReID blur gates: "
-        f"skip_var={env['FACE_PIPELINE_REID_BLUR_SKIP_VAR']} "
-        f"sharpen_var={env['FACE_PIPELINE_REID_BLUR_SHARPEN_VAR']} "
-        f"lap_alpha={env['FACE_PIPELINE_REID_LAPLACIAN_ALPHA']}",
-        file=sys.stderr,
-    )
     
     if sys.platform == "darwin":
-        # macOS: add executable directory to dylib search path
+        # macOS: include executable and bundled lib/ in dylib search path
         existing_path = env.get("DYLD_LIBRARY_PATH", "")
+        bundle_paths = (
+            f"{executable_dir}:{executable_lib_dir}"
+            if Path(executable_lib_dir).exists()
+            else executable_dir
+        )
         env["DYLD_LIBRARY_PATH"] = (
-            f"{executable_dir}:{existing_path}" if existing_path else executable_dir
+            f"{bundle_paths}:{existing_path}" if existing_path else bundle_paths
         )
     elif sys.platform == "linux":
-        # Linux: add executable directory to shared library search path
+        # Linux: include executable and bundled lib/ in shared library search path
         existing_path = env.get("LD_LIBRARY_PATH", "")
+        bundle_paths = (
+            f"{executable_dir}:{executable_lib_dir}"
+            if Path(executable_lib_dir).exists()
+            else executable_dir
+        )
         env["LD_LIBRARY_PATH"] = (
-            f"{executable_dir}:{existing_path}" if existing_path else executable_dir
+            f"{bundle_paths}:{existing_path}" if existing_path else bundle_paths
         )
     # Windows: DLLs in the same directory as .exe are found automatically
     
     print("Running face_pipeline executable...", file=sys.stderr)
     try:
+        wall_start = time.perf_counter()
+        cpu_start = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
         result = subprocess.run(
             cmd,
             input=frame_input,
@@ -195,27 +220,84 @@ def run_face_pipeline(
             text=False,
             env=env,
         )
+        wall_end = time.perf_counter()
+        cpu_end = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
 
+        gmc_info: Dict[int, Dict[str, float]] = {}
         # Forward any native logs (stderr) to our stderr for dev visibility.
         if result.stderr:
             stderr_text = result.stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 print(stderr_text, file=sys.stderr)
-                reid_lines = [
-                    line for line in stderr_text.splitlines()
-                    if line.startswith("ReID:")
-                ]
-                if reid_lines:
-                    print("ReID summary:", file=sys.stderr)
-                    for line in reid_lines:
-                        print(f"  {line}", file=sys.stderr)
+                gmc_pattern = re.compile(r"^GMC: frame=(\d+) ok=(\d+) m=\[([^\]]+)\]")
+                for line in stderr_text.splitlines():
+                    m = gmc_pattern.match(line.strip())
+                    if not m:
+                        continue
+                    frame_idx = int(m.group(1))
+                    ok = 1.0 if m.group(2) == "1" else 0.0
+                    raw = m.group(3).replace(";", " ")
+                    parts = raw.split()
+                    if len(parts) != 9:
+                        continue
+                    vals = [float(p) for p in parts]
+                    dx = vals[2]
+                    dy = vals[5]
+                    mag = math.hypot(dx, dy)
+                    gmc_info[frame_idx] = {
+                        "ok": ok,
+                        "dx": dx,
+                        "dy": dy,
+                        "mag": mag,
+                        "m00": vals[0],
+                        "m01": vals[1],
+                        "m02": vals[2],
+                        "m10": vals[3],
+                        "m11": vals[4],
+                        "m12": vals[5],
+                        "m20": vals[6],
+                        "m21": vals[7],
+                        "m22": vals[8],
+                    }
         
         # Parse JSON output
         output_text = result.stdout.decode("utf-8")
         tracking_data = json.loads(output_text)
-        
-        print(f"Found {len(tracking_data.get('tracks', []))} tracks", file=sys.stderr)
-        return tracking_data
+
+        wall_time = max(1e-9, wall_end - wall_start)
+        if cpu_start is not None and cpu_end is not None:
+            child_cpu = (
+                (cpu_end.ru_utime - cpu_start.ru_utime)
+                + (cpu_end.ru_stime - cpu_start.ru_stime)
+            )
+        else:
+            child_cpu = 0.0
+        processing_fps = float(len(frame_paths)) / wall_time
+        realtime_factor = processing_fps / max(1e-6, video_fps)
+        avg_cores = child_cpu / wall_time
+        profile = {
+            "wallTimeSec": wall_time,
+            "childCpuTimeSec": child_cpu,
+            "processingFps": processing_fps,
+            "videoFps": float(video_fps),
+            "realtimeFactor": realtime_factor,
+            "avgCpuCores": avg_cores,
+        }
+        print(
+            "Performance: "
+            f"fps={processing_fps:.2f} "
+            f"rtx={realtime_factor:.2f} "
+            f"cpu_sec={child_cpu:.2f} "
+            f"avg_cores={avg_cores:.2f}",
+            file=sys.stderr,
+        )
+
+        print(
+            f"Found {len(tracking_data.get('people', []))} people and "
+            f"{len(tracking_data.get('faceTracks', []))} face tracks",
+            file=sys.stderr,
+        )
+        return tracking_data, gmc_info, profile
         
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode("utf-8") if e.stderr else "Unknown error"
@@ -246,6 +328,53 @@ def _draw_hollow_rectangle(
     cv2.line(frame, (x2, y1), (x2, y2), color, thickness)
 
 
+def _muted_color(color: Tuple[int, int, int], mix: float = COLOR_MUTING_FACTOR) -> Tuple[int, int, int]:
+    """Blend a color with neutral gray to reduce saturation/brightness."""
+    gray = 128
+    mix_clamped = max(0.0, min(1.0, mix))
+    return tuple(
+        int(channel * (1.0 - mix_clamped) + gray * mix_clamped) for channel in color
+    )
+
+
+def _draw_text_with_shadow(
+    frame: Any,
+    text: str,
+    org: Tuple[int, int],
+    scale: float,
+    text_color: Tuple[int, int, int],
+    thickness: int,
+    shadow_color: Tuple[int, int, int] = (0, 0, 0),
+    shadow_offset: Tuple[int, int] = LABEL_SHADOW_OFFSET,
+) -> None:
+    """Draw readable text by rendering a subtle shadow first."""
+    import cv2
+
+    font_face = cv2.FONT_HERSHEY_DUPLEX
+    x, y = org
+    sx, sy = shadow_offset
+    cv2.putText(
+        frame,
+        text,
+        (x + sx, y + sy),
+        font_face,
+        scale,
+        shadow_color,
+        max(1, thickness + 1),
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        text,
+        org,
+        font_face,
+        scale,
+        text_color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def render_debug_video(
     video_path: str,
     tracking_data: Dict[str, Any],
@@ -253,6 +382,7 @@ def render_debug_video(
     fps: float,
     width: int,
     height: int,
+    gmc_info: Optional[Dict[int, Dict[str, float]]] = None,
 ) -> None:
     """Render debug video with face bounding boxes overlaid.
     
@@ -289,23 +419,32 @@ def render_debug_video(
     except Exception as e:
         raise RuntimeError(f"Cannot create output directory {output_dir}: {e}") from e
     
-    # Build frame index -> tracks mapping
-    # tracks: [{"id": 0, "frames": [{"frameIndex": 0, "bbox": [x1, y1, x2, y2], "confidence": 0.9}]}]
-    frame_tracks: Dict[int, List[Dict[str, Any]]] = {}
-    
-    for track in tracking_data.get("tracks", []):
-        track_id = track["id"]
-        color = FACE_COLORS[track_id % len(FACE_COLORS)]
-        
-        for frame_data in track.get("frames", []):
-            frame_idx = frame_data["frameIndex"]
-            if frame_idx not in frame_tracks:
-                frame_tracks[frame_idx] = []
-            
-            frame_tracks[frame_idx].append({
-                "track_id": track_id,
-                "bbox": frame_data["bbox"],  # Normalized [x1, y1, x2, y2]
+    # Build frame maps from new schema:
+    # people: [{id, frames:[{frameIndex,bbox,confidence}]}]
+    # faceTracks: [{personId, frames:[{frameIndex,bbox,confidence,assocIou}]}]
+    frame_people: Dict[int, List[Dict[str, Any]]] = {}
+    frame_faces: Dict[int, List[Dict[str, Any]]] = {}
+
+    for person in tracking_data.get("people", []):
+        person_id = int(person["id"])
+        for frame_data in person.get("frames", []):
+            frame_idx = int(frame_data["frameIndex"])
+            frame_people.setdefault(frame_idx, []).append({
+                "person_id": person_id,
+                "bbox": frame_data["bbox"],
                 "confidence": frame_data.get("confidence", 0.0),
+            })
+
+    for track in tracking_data.get("faceTracks", []):
+        person_id = int(track["personId"])
+        color = _muted_color(FACE_COLORS[person_id % len(FACE_COLORS)])
+        for frame_data in track.get("frames", []):
+            frame_idx = int(frame_data["frameIndex"])
+            frame_faces.setdefault(frame_idx, []).append({
+                "person_id": person_id,
+                "bbox": frame_data["bbox"],
+                "confidence": frame_data.get("confidence", 0.0),
+                "assoc_iou": frame_data.get("assocIou", 0.0),
                 "color": color,
             })
     
@@ -372,46 +511,99 @@ def render_debug_video(
             if not ret:
                 break
             
-            # Draw bounding boxes for this frame
-            if frame_count in frame_tracks:
-                for track_info in frame_tracks[frame_count]:
-                    bbox_norm = track_info["bbox"]
-                    color = track_info["color"]
-                    track_id = track_info["track_id"]
-                    confidence = track_info["confidence"]
-                    
-                    # Convert normalized coordinates to pixels
+            # Optional person boxes for diagnostics
+            if frame_count in frame_people:
+                for person_info in frame_people[frame_count]:
+                    bbox_norm = person_info["bbox"]
+                    person_id = person_info["person_id"]
+                    person_color = _muted_color(FACE_COLORS[person_id % len(FACE_COLORS)])
                     x1 = int(bbox_norm[0] * width)
                     y1 = int(bbox_norm[1] * height)
                     x2 = int(bbox_norm[2] * width)
                     y2 = int(bbox_norm[3] * height)
-                    
-                    # Draw bounding box
+                    _draw_hollow_rectangle(frame, x1, y1, x2, y2, person_color, 1)
+                    _draw_text_with_shadow(
+                        frame=frame,
+                        text=f"P:{person_id}",
+                        org=(x1 + 1, max(14, y1 - 2)),
+                        scale=0.5,
+                        text_color=(255, 255, 255),
+                        thickness=1,
+                    )
+
+            # Associated face boxes (primary overlay)
+            if frame_count in frame_faces:
+                for face_info in frame_faces[frame_count]:
+                    bbox_norm = face_info["bbox"]
+                    color = face_info["color"]
+                    person_id = face_info["person_id"]
+                    confidence = face_info["confidence"]
+                    assoc_iou = face_info["assoc_iou"]
+
+                    x1 = int(bbox_norm[0] * width)
+                    y1 = int(bbox_norm[1] * height)
+                    x2 = int(bbox_norm[2] * width)
+                    y2 = int(bbox_norm[3] * height)
+
                     _draw_hollow_rectangle(frame, x1, y1, x2, y2, color, BORDER_THICKNESS)
-                    
-                    # Draw track ID and confidence
-                    label = f"ID:{track_id} ({confidence:.2f})"
-                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    label_y = max(y1 - 5, label_size[1] + 5)
-                    
-                    # Draw label background
+
+                    label = f"PID:{person_id} c={confidence:.2f} iou={assoc_iou:.2f}"
+                    label_size, label_baseline = cv2.getTextSize(
+                        label,
+                        cv2.FONT_HERSHEY_DUPLEX,
+                        LABEL_FONT_SCALE,
+                        LABEL_FONT_THICKNESS,
+                    )
+                    label_y = max(y1 - 6, label_size[1] + label_baseline + 6)
+                    label_x = x1
                     cv2.rectangle(
                         frame,
-                        (x1, label_y - label_size[1] - 5),
-                        (x1 + label_size[0] + 5, label_y + 5),
+                        (label_x, label_y - label_size[1] - label_baseline - 6),
+                        (label_x + label_size[0] + 8, label_y + 4),
                         color,
                         -1,
                     )
-                    # Draw label text
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1 + 2, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        1,
+                    _draw_text_with_shadow(
+                        frame=frame,
+                        text=label,
+                        org=(label_x + 4, label_y),
+                        scale=LABEL_FONT_SCALE,
+                        text_color=(255, 255, 255),
+                        thickness=LABEL_FONT_THICKNESS,
                     )
+
+            # Draw GMC overlay (if available for this frame)
+            if gmc_info and frame_count in gmc_info:
+                info = gmc_info[frame_count]
+                gmc_label = (
+                    f"GMC ok={int(info['ok'])} "
+                    f"dx={info['dx']:.2f} dy={info['dy']:.2f} "
+                    f"mag={info['mag']:.2f}"
+                )
+                gmc_scale = 0.55
+                gmc_thickness = 1
+                gmc_size, gmc_baseline = cv2.getTextSize(
+                    gmc_label,
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    gmc_scale,
+                    gmc_thickness,
+                )
+                gx, gy = 10, 20
+                cv2.rectangle(
+                    frame,
+                    (gx - 4, gy - gmc_size[1] - gmc_baseline - 6),
+                    (gx + gmc_size[0] + 6, gy + 6),
+                    (0, 0, 0),
+                    -1,
+                )
+                _draw_text_with_shadow(
+                    frame=frame,
+                    text=gmc_label,
+                    org=(gx, gy),
+                    scale=gmc_scale,
+                    text_color=(255, 255, 255),
+                    thickness=gmc_thickness,
+                )
             
             out.write(frame)
             frame_count += 1
@@ -436,14 +628,18 @@ def run_test(
     video_path: str,
     output_path: str,
     detection_fps: float = 10.0,
+    gmc_fps: float = 0.0,
     conf_thresh: float = 0.5,
     iou_thresh: float = 0.15,
     keep_frames: bool = False,
 ) -> None:
     """Run the complete test pipeline."""
+    total_start = time.perf_counter()
+    stage_wall_sec: Dict[str, float] = {}
+
     script_dir = Path(__file__).parent.parent
     model_dir = str(script_dir / "src" / "bin" / "models")
-    reid_dir = str(script_dir / "src" / "bin" / "models" / "mobilefacenet_arcface")
+    body_reid_dir = str(script_dir / "src" / "bin" / "models" / "osnet_ibn_x1_0")
     
     # Ensure output directory exists early (used for tracking JSON + video)
     output_dir = Path(output_path).parent
@@ -457,32 +653,90 @@ def run_test(
     with tempfile.TemporaryDirectory(prefix="face_pipeline_test_") as temp_dir:
         temp_path = Path(temp_dir)
         print(f"Extracting frames to {temp_path}...", file=sys.stderr)
-        
+
+        extract_start = time.perf_counter()
         frame_paths, fps, width, height = extract_frames(video_path, temp_path)
+        stage_wall_sec["extractFrames"] = time.perf_counter() - extract_start
         
         if len(frame_paths) == 0:
             raise ValueError("No frames extracted from video")
         
         # Run face pipeline
-        tracking_data = run_face_pipeline(
+        native_call_start = time.perf_counter()
+        tracking_data, gmc_info, profile = run_face_pipeline(
             frame_paths=frame_paths,
             model_dir=model_dir,
-            reid_model_dir=reid_dir,
+            body_reid_model_dir=body_reid_dir,
             video_fps=fps,
             detection_fps=detection_fps,
+            gmc_fps=gmc_fps,
             conf_thresh=conf_thresh,
             iou_thresh=iou_thresh,
         )
-        
+        stage_wall_sec["nativePipelineCall"] = time.perf_counter() - native_call_start
+        stage_wall_sec["nativePipeline"] = _safe_float(
+            profile.get("wallTimeSec"),
+            stage_wall_sec["nativePipelineCall"],
+        )
+
         # Save tracking data for debugging
-        tracking_output_path = output_dir / "tracking_output.json"
+        tracking_output_path = output_dir / f"{Path(output_path).stem}_tracking_output.json"
+        if gmc_info:
+            tracking_data["_gmc"] = [
+                {"frameIndex": k, **v} for k, v in sorted(gmc_info.items())
+            ]
+        stats = tracking_data.get("stats", {})
+        timing_ms = stats.get("timingMs", {})
+        person_breakdown_sec = {
+            "preprocess": _safe_float(timing_ms.get("personPreprocess")) / 1000.0,
+            "infer": _safe_float(timing_ms.get("personInfer")) / 1000.0,
+            "decode": _safe_float(timing_ms.get("personDecode")) / 1000.0,
+        }
+        person_breakdown_total_sec = sum(person_breakdown_sec.values())
+        native_internal_sec = {
+            "personDetect": _safe_float(timing_ms.get("personDetect")) / 1000.0,
+            "bodyReid": _safe_float(timing_ms.get("bodyReid")) / 1000.0,
+            "faceDetect": _safe_float(timing_ms.get("faceDetect")) / 1000.0,
+            "associate": _safe_float(timing_ms.get("associate")) / 1000.0,
+            "trackUpdate": _safe_float(timing_ms.get("trackUpdate")) / 1000.0,
+        }
+        native_internal_total_sec = sum(native_internal_sec.values())
+        native_wall_sec = stage_wall_sec["nativePipeline"]
+        native_overhead_sec = max(0.0, native_wall_sec - native_internal_total_sec)
+
+        stage_wall_sec["nativePostProcess"] = max(
+            0.0,
+            stage_wall_sec["nativePipelineCall"] - stage_wall_sec["nativePipeline"],
+        )
+
+        save_start = time.perf_counter()
+        tracking_data["profile"] = profile
+        tracking_data["metrics"] = {
+            "totalWallSec": 0.0,  # Filled after render stage.
+            "frameCount": len(frame_paths),
+            "videoFps": float(fps),
+            "videoDurationSec": float(len(frame_paths)) / max(1e-9, float(fps)),
+            "stagesSec": dict(stage_wall_sec),
+            "nativeBreakdownSec": {
+                **native_internal_sec,
+                "internalTotal": native_internal_total_sec,
+                "overhead": native_overhead_sec,
+                "wall": native_wall_sec,
+            },
+            "personDetectBreakdownSec": {
+                **person_breakdown_sec,
+                "total": person_breakdown_total_sec,
+            },
+        }
         with open(tracking_output_path, 'w') as f:
             import json as json_module
             json_module.dump(tracking_data, f, indent=2)
+        stage_wall_sec["saveTrackingJson"] = time.perf_counter() - save_start
         print(f"Saved tracking data to {tracking_output_path}", file=sys.stderr)
         
         # Render debug video
         print(f"Rendering debug video to {output_path}...", file=sys.stderr)
+        render_start = time.perf_counter()
         render_debug_video(
             video_path=video_path,
             tracking_data=tracking_data,
@@ -490,10 +744,13 @@ def run_test(
             fps=fps,
             width=width,
             height=height,
+            gmc_info=gmc_info,
         )
+        stage_wall_sec["renderDebugVideo"] = time.perf_counter() - render_start
         
         # Optionally keep frames
         if keep_frames:
+            keep_start = time.perf_counter()
             frames_dir = Path(output_path).parent / f"{Path(output_path).stem}_frames"
             frames_dir.mkdir(exist_ok=True)
             for frame_path in frame_paths:
@@ -501,6 +758,70 @@ def run_test(
                 import shutil
                 shutil.copy2(frame_path, frames_dir / frame_name)
             print(f"Frames saved to {frames_dir}", file=sys.stderr)
+            stage_wall_sec["keepFrames"] = time.perf_counter() - keep_start
+
+        total_wall_sec = time.perf_counter() - total_start
+        stage_wall_sec["total"] = total_wall_sec
+        total_stage_accounted = sum(v for k, v in stage_wall_sec.items() if k != "total")
+        stage_wall_sec["unaccounted"] = max(0.0, total_wall_sec - total_stage_accounted)
+
+        sorted_stages = sorted(
+            ((k, v) for k, v in stage_wall_sec.items() if k != "total"),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        print("Timing breakdown (wall sec):", file=sys.stderr)
+        for name, sec in sorted_stages:
+            pct = (sec / total_wall_sec * 100.0) if total_wall_sec > 0 else 0.0
+            fps_eff = (len(frame_paths) / sec) if sec > 0 and name not in {"saveTrackingJson", "unaccounted"} else 0.0
+            if fps_eff > 0:
+                print(
+                    f"  {name:>18}: {sec:7.3f}s ({pct:5.1f}%) [{fps_eff:6.2f} fps]",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"  {name:>18}: {sec:7.3f}s ({pct:5.1f}%)",
+                    file=sys.stderr,
+                )
+        print(f"  {'total':>18}: {total_wall_sec:7.3f}s (100.0%)", file=sys.stderr)
+
+        print("Native pipeline internal timing (sec):", file=sys.stderr)
+        native_sorted = sorted(native_internal_sec.items(), key=lambda kv: kv[1], reverse=True)
+        for name, sec in native_sorted:
+            pct = (sec / native_wall_sec * 100.0) if native_wall_sec > 0 else 0.0
+            print(f"  {name:>18}: {sec:7.3f}s ({pct:5.1f}% of native wall)", file=sys.stderr)
+        print(
+            f"  {'overhead':>18}: {native_overhead_sec:7.3f}s "
+            f"({(native_overhead_sec / native_wall_sec * 100.0) if native_wall_sec > 0 else 0.0:5.1f}% of native wall)",
+            file=sys.stderr,
+        )
+        if native_internal_sec["personDetect"] > 0.0:
+            print("Person detector breakdown (sec):", file=sys.stderr)
+            for name, sec in sorted(person_breakdown_sec.items(), key=lambda kv: kv[1], reverse=True):
+                pct = sec / native_internal_sec["personDetect"] * 100.0
+                print(
+                    f"  {name:>18}: {sec:7.3f}s ({pct:5.1f}% of personDetect)",
+                    file=sys.stderr,
+                )
+            person_gap_sec = max(0.0, native_internal_sec["personDetect"] - person_breakdown_total_sec)
+            print(
+                f"  {'other':>18}: {person_gap_sec:7.3f}s "
+                f"({(person_gap_sec / native_internal_sec['personDetect'] * 100.0):5.1f}% of personDetect)",
+                file=sys.stderr,
+            )
+
+        # Refresh JSON with final timings including render + total.
+        tracking_data["metrics"]["totalWallSec"] = total_wall_sec
+        tracking_data["metrics"]["stagesSec"] = dict(stage_wall_sec)
+        tracking_data["metrics"]["stagesPctOfTotal"] = {
+            k: (v / total_wall_sec * 100.0) if total_wall_sec > 0 else 0.0
+            for k, v in stage_wall_sec.items()
+        }
+        with open(tracking_output_path, 'w') as f:
+            import json as json_module
+            json_module.dump(tracking_data, f, indent=2)
+        print(f"Updated metrics in {tracking_output_path}", file=sys.stderr)
     
     print(f"Success! Output video: {output_path}", file=sys.stderr)
 
@@ -524,6 +845,12 @@ def main() -> None:
         type=float,
         default=10.0,
         help="Detection sampling rate (default: 10.0)",
+    )
+    parser.add_argument(
+        "--gmc-fps",
+        type=float,
+        default=0.0,
+        help="GMC sampling rate (0 = auto; default: 0.0)",
     )
     parser.add_argument(
         "--conf",
@@ -562,6 +889,7 @@ def main() -> None:
             video_path=args.video,
             output_path=output_path,
             detection_fps=args.detection_fps,
+            gmc_fps=args.gmc_fps,
             conf_thresh=args.conf,
             iou_thresh=args.iou,
             keep_frames=args.keep_frames,

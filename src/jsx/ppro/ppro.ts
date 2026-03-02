@@ -11,6 +11,41 @@ const timeFromTicks = (ticks: string): Time => {
   return t;
 };
 
+const TICKS_PER_SECOND = 254016000000;
+const FACE_BLUR_EFFECT_TRACKITEM_NAME = "FaceBlur_Effect";
+
+const snapTicksToFrame = (
+  ticks: number,
+  ticksPerFrame: number,
+  mode: "floor" | "ceil" | "round",
+): number => {
+  if (!isFinite(ticks) || !isFinite(ticksPerFrame) || ticksPerFrame <= 0) {
+    return ticks;
+  }
+  const frames = ticks / ticksPerFrame;
+  if (mode === "floor") return Math.floor(frames) * ticksPerFrame;
+  if (mode === "ceil") return Math.ceil(frames) * ticksPerFrame;
+  return Math.round(frames) * ticksPerFrame;
+};
+
+const trySetTrackItemEndTicks = (
+  trackItem: TrackItem,
+  endTicks: string,
+): boolean => {
+  try {
+    // Premiere timeline TrackItem uses absolute sequence time for .end.
+    trackItem.end = timeFromTicks(endTicks);
+  } catch (e) {
+    return false;
+  }
+
+  try {
+    return trackItem.end && trackItem.end.ticks === endTicks;
+  } catch (e) {
+    return false;
+  }
+};
+
 /**
  * Imports a modified MOGRT file into the active sequence
  * @param mogrtPath Complete path to .mogrt file
@@ -22,8 +57,9 @@ const timeFromTicks = (ticks: string): Time => {
 export const importModifiedMogrt = (
   mogrtPath: string,
   timeInTicks?: string,
+  endTicks?: string,
   videoTrackOffset: number = 2,
-  audioTrackOffset: number = 2
+  audioTrackOffset: number = 2,
 ): string => {
   try {
     if (!app.project.activeSequence) {
@@ -31,6 +67,8 @@ export const importModifiedMogrt = (
     }
 
     const activeSequence = app.project.activeSequence;
+    const settings = activeSequence.getSettings();
+    const tpf = parseInt(settings.videoFrameRate.ticks as string, 10);
 
     // Determine timeInTicks - use playhead position if not provided
     let insertTime: string;
@@ -41,9 +79,16 @@ export const importModifiedMogrt = (
       const playhead = activeSequence.getPlayerPosition();
       insertTime = playhead.toString();
     }
+    const rawInsertTicksNum = parseInt(insertTime, 10);
+    const insertTicksNum = isNaN(rawInsertTicksNum)
+      ? rawInsertTicksNum
+      : snapTicksToFrame(rawInsertTicksNum, tpf, "floor");
+    if (!isNaN(insertTicksNum)) {
+      insertTime = String(insertTicksNum);
+    }
 
     sdkLog(
-      `Importing MOGRT from: ${mogrtPath}\nTime: ${insertTime}\nVideo track offset: ${videoTrackOffset}\nAudio track offset: ${audioTrackOffset}`
+      `Importing MOGRT from: ${mogrtPath}\nTime: ${insertTime}\nEnd: ${endTicks || "(none)"}\nVideo track offset: ${videoTrackOffset}\nAudio track offset: ${audioTrackOffset}`,
     );
 
     // Import the MOGRT
@@ -51,11 +96,61 @@ export const importModifiedMogrt = (
       mogrtPath,
       insertTime,
       videoTrackOffset,
-      audioTrackOffset
+      audioTrackOffset,
     );
 
     if (trackItem) {
-      return `MOGRT imported successfully at time ${insertTime}.`;
+      const messages: string[] = [];
+      try {
+        trackItem.name = FACE_BLUR_EFFECT_TRACKITEM_NAME;
+      } catch (e) {
+        // Non-fatal; continue if this host version disallows setting name.
+        messages.push("Could not set standardized MOGRT name.");
+      }
+
+      if (!isNaN(insertTicksNum)) {
+        // Step 1: force a short initial duration (1 second) right after import.
+        const oneSecondEndTicks = String(insertTicksNum + TICKS_PER_SECOND);
+        const oneSecondOk = trySetTrackItemEndTicks(
+          trackItem,
+          oneSecondEndTicks,
+        );
+        if (oneSecondOk) {
+          messages.push("Initial duration set to 1s.");
+        } else {
+          messages.push("Could not force 1s initial duration.");
+        }
+      }
+
+      // Step 2: stretch the clip to the requested final range.
+      if (endTicks && endTicks.length > 0) {
+        const rawEndTicksNum = parseInt(endTicks, 10);
+        const endTicksNum = isNaN(rawEndTicksNum)
+          ? rawEndTicksNum
+          : snapTicksToFrame(rawEndTicksNum, tpf, "ceil");
+        if (
+          !isNaN(endTicksNum) &&
+          !isNaN(insertTicksNum) &&
+          endTicksNum > insertTicksNum
+        ) {
+          const finalOk = trySetTrackItemEndTicks(
+            trackItem,
+            String(endTicksNum),
+          );
+          if (finalOk) {
+            messages.push("Adjusted to final selection duration.");
+          } else {
+            messages.push("Failed to apply final selection duration.");
+          }
+        } else {
+          messages.push("Skipped final duration: invalid endTicks.");
+        }
+      }
+
+      const details = messages.join(" ");
+      return details.length > 0
+        ? `MOGRT imported successfully at time ${insertTime}. ${details}`
+        : `MOGRT imported successfully at time ${insertTime}.`;
     } else {
       return "Failed to import MOGRT - importMGT returned null.";
     }
@@ -64,95 +159,190 @@ export const importModifiedMogrt = (
   }
 };
 
-/**
- * Finds the selected clips, computes the min start and max end, and sets the
- * sequence In/Out to that range. Returns timing info useful to CEP.
- */
-export const getSelectionRangeAndSetInOut = ():
-  | {
-      startTicks: string;
-      endTicks: string;
-      ticksPerFrame: string;
-      numFrames: number;
+const FACE_BLUR_MARKER_KIND = "face-blur-segment";
+const FACE_BLUR_MARKER_SCHEMA_VERSION = 1;
+const FACE_BLUR_MARKER_NAME_PREFIX = "FBSEG:";
+
+interface SegmentDescriptor {
+  segmentId: string;
+  startTicks: string;
+  endTicks: string;
+  ticksPerFrame: string;
+  numFrames: number;
+  trackIndex?: number;
+  clipName?: string;
+}
+
+interface SegmentMarkerPayload {
+  kind: "face-blur-segment";
+  schemaVersion: 1;
+  segment: SegmentDescriptor;
+  pngDir: string;
+  masks: any[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+const parseTicks = (ticks: string): number => {
+  const n = parseInt(ticks, 10);
+  return isNaN(n) ? 0 : n;
+};
+
+const ticksToSeconds = (ticks: string): number => {
+  return parseTicks(ticks) / TICKS_PER_SECOND;
+};
+
+const getSelectedClips = (seq: Sequence): TrackItem[] => {
+  let selection: TrackItem[] = [];
+  try {
+    //@ts-ignore
+    const sel = seq.getSelection && seq.getSelection();
+    if (sel && sel.length) {
+      selection = sel;
     }
-  | string => {
+  } catch (e) {
+    // ignore and fall back to scanning tracks
+  }
+
+  if (selection.length > 0) {
+    const filtered: TrackItem[] = [];
+    for (let i = 0; i < selection.length; i++) {
+      const clip = selection[i];
+      if (
+        clip &&
+        clip.name &&
+        String(clip.name) === FACE_BLUR_EFFECT_TRACKITEM_NAME
+      ) {
+        continue;
+      }
+      filtered.push(clip);
+    }
+    return filtered;
+  }
+
+  for (let i = 0; i < seq.videoTracks.numTracks; i++) {
+    const track = seq.videoTracks[i];
+    for (let j = 0; j < track.clips.numItems; j++) {
+      const clip = track.clips[j];
+      //@ts-ignore
+      if (clip && clip.isSelected) {
+        //@ts-ignore
+        if (clip.isSelected()) {
+          if (
+            clip.name &&
+            String(clip.name) === FACE_BLUR_EFFECT_TRACKITEM_NAME
+          ) {
+            continue;
+          }
+          selection.push(clip);
+        }
+      }
+    }
+  }
+  return selection;
+};
+
+const getTrackIndexForClip = (seq: Sequence, clipNodeId: string): number => {
+  for (let i = 0; i < seq.videoTracks.numTracks; i++) {
+    const track = seq.videoTracks[i];
+    for (let j = 0; j < track.clips.numItems; j++) {
+      if (track.clips[j].nodeId === clipNodeId) {
+        return i;
+      }
+    }
+  }
+  return -1;
+};
+
+/**
+ * Returns selected clips as independent segment descriptors.
+ */
+export const getSelectedClipSegments = (): SegmentDescriptor[] | string => {
   try {
     if (!app.project.activeSequence) {
       return "No active sequence found.";
     }
     const seq = app.project.activeSequence;
-
-    // Prefer native getSelection() if available
-    let selection: TrackItem[] = [];
-    try {
-      //@ts-ignore
-      const sel = seq.getSelection && seq.getSelection();
-      if (sel && sel.length) {
-        selection = sel;
-      }
-    } catch (e) {
-      // ignore and fall back to scan tracks
-    }
-
-    // Fallback: scan all video tracks for selected clips
-    if (selection.length === 0) {
-      for (let i = 0; i < seq.videoTracks.numTracks; i++) {
-        const track = seq.videoTracks[i];
-        for (let j = 0; j < track.clips.numItems; j++) {
-          const clip = track.clips[j];
-          //@ts-ignore
-          if (clip && clip.isSelected) {
-            //@ts-ignore
-            if (clip.isSelected()) {
-              selection.push(clip);
-            }
-          }
-        }
-      }
-    }
-
+    const selection = getSelectedClips(seq);
     if (selection.length === 0) {
       return "No clips are selected in the active sequence.";
     }
 
-    // Compute start/end in ticks
-    let minStart = Number.POSITIVE_INFINITY;
-    let maxEnd = 0;
-    for (let i = 0; i < selection.length; i++) {
-      const item = selection[i];
-      const s = parseInt(item.start.ticks, 10);
-      const e = parseInt(item.end.ticks, 10);
-      if (!isNaN(s) && s < minStart) minStart = s;
-      if (!isNaN(e) && e > maxEnd) maxEnd = e;
-    }
-    if (!isFinite(minStart) || maxEnd <= minStart) {
-      return "Failed to compute a valid selection range.";
-    }
-
-    // Set sequence In/Out
-    const inTicks = String(minStart);
-    const outTicks = String(maxEnd);
-    //@ts-ignore setInPoint expects ticks string
-    seq.setInPoint(inTicks);
-    //@ts-ignore
-    seq.setOutPoint(outTicks);
-
-    // Provide timing info
     const settings = seq.getSettings();
-    const tpf = settings.videoFrameRate.ticks as string;
-    const frames = Math.max(
-      1,
-      Math.round((maxEnd - minStart) / parseInt(tpf, 10))
-    );
+    const tpf = parseInt(settings.videoFrameRate.ticks as string, 10);
+    if (!isFinite(tpf) || tpf <= 0) {
+      return "Unable to resolve sequence frame rate.";
+    }
 
-    return {
-      startTicks: inTicks,
-      endTicks: outTicks,
-      ticksPerFrame: tpf,
-      numFrames: frames,
-    };
+    const deduped: { [nodeId: string]: boolean } = {};
+    const segments: SegmentDescriptor[] = [];
+    for (let i = 0; i < selection.length; i++) {
+      const clip = selection[i];
+      const nodeId = clip.nodeId;
+      if (!nodeId || deduped[nodeId]) {
+        continue;
+      }
+      const trackIndex = getTrackIndexForClip(seq, nodeId);
+      if (trackIndex < 0) {
+        // Ignore audio-only or non-video selected items.
+        continue;
+      }
+      deduped[nodeId] = true;
+
+      const startRaw = parseInt(clip.start.ticks, 10);
+      const endRaw = parseInt(clip.end.ticks, 10);
+      const snappedStart = snapTicksToFrame(startRaw, tpf, "floor");
+      const snappedEnd = snapTicksToFrame(endRaw, tpf, "ceil");
+      if (
+        !isFinite(snappedStart) ||
+        !isFinite(snappedEnd) ||
+        snappedEnd <= snappedStart
+      ) {
+        continue;
+      }
+      const numFrames = Math.max(
+        1,
+        Math.round((snappedEnd - snappedStart) / tpf),
+      );
+      segments.push({
+        segmentId: String(nodeId),
+        startTicks: String(snappedStart),
+        endTicks: String(snappedEnd),
+        ticksPerFrame: String(settings.videoFrameRate.ticks),
+        numFrames,
+        trackIndex,
+        clipName: clip.name ? String(clip.name) : "",
+      });
+    }
+
+    if (segments.length === 0) {
+      return "No valid selected clips found.";
+    }
+
+    segments.sort((a, b) => {
+      const startDiff = parseTicks(a.startTicks) - parseTicks(b.startTicks);
+      if (startDiff !== 0) return startDiff;
+      return (a.trackIndex || 0) - (b.trackIndex || 0);
+    });
+    return segments;
   } catch (e: any) {
-    return `Error in getSelectionRangeAndSetInOut: ${e.toString()}`;
+    return `Error in getSelectedClipSegments: ${e.toString()}`;
+  }
+};
+
+const applySequenceInOut = (segment: SegmentDescriptor): string | null => {
+  try {
+    if (!app.project.activeSequence) {
+      return "No active sequence found.";
+    }
+    const seq = app.project.activeSequence;
+    //@ts-ignore setInPoint expects ticks string
+    seq.setInPoint(segment.startTicks);
+    //@ts-ignore setOutPoint expects ticks string
+    seq.setOutPoint(segment.endTicks);
+    return null;
+  } catch (e: any) {
+    return `Error setting In/Out: ${e.toString()}`;
   }
 };
 
@@ -180,13 +370,13 @@ export const getSequenceResolution = ():
 };
 
 /**
- * Exports the current selection (between In/Out points) as a PNG image sequence
- * using the provided FaceBlur preset. The outputDir will be created if needed.
+ * Exports a single selected segment as PNG image sequence.
  * Returns the directory, base name, and file count (best-effort after render).
  */
-export const exportSelectionAsImageSequence = (
+export const exportSegmentAsImageSequence = (
+  segment: SegmentDescriptor,
   outputDir: string,
-  presetPathRel?: string
+  presetPathRel?: string,
 ):
   | {
       outputDir: string;
@@ -199,6 +389,10 @@ export const exportSelectionAsImageSequence = (
       return "No active sequence found.";
     }
     const seq = app.project.activeSequence;
+    const inOutErr = applySequenceInOut(segment);
+    if (inOutErr) {
+      return inOutErr;
+    }
 
     // Resolve extension root → bin/FaceBlurPreset.epr
     // jsx file lives at <extRoot>/jsx/index.js[xbin]; navigate up one to <extRoot>
@@ -248,7 +442,198 @@ export const exportSelectionAsImageSequence = (
       count,
     };
   } catch (e: any) {
-    return `Error in exportSelectionAsImageSequence: ${e.toString()}`;
+    return `Error in exportSegmentAsImageSequence: ${e.toString()}`;
+  }
+};
+
+const parsePayloadFromMarker = (
+  marker: Marker,
+): SegmentMarkerPayload | null => {
+  try {
+    const comments = marker.comments;
+    if (!comments || typeof comments !== "string") return null;
+    const raw: any = JSON.parse(comments);
+    if (!raw || typeof raw !== "object") return null;
+    if (raw.kind !== FACE_BLUR_MARKER_KIND) return null;
+    if (raw.schemaVersion !== FACE_BLUR_MARKER_SCHEMA_VERSION) return null;
+    if (!raw.segment || typeof raw.segment !== "object") return null;
+    if (typeof raw.segment.segmentId !== "string") return null;
+    if (typeof raw.segment.startTicks !== "string") return null;
+    if (typeof raw.segment.endTicks !== "string") return null;
+    if (typeof raw.segment.ticksPerFrame !== "string") return null;
+    if (typeof raw.segment.numFrames !== "number") return null;
+    return raw as SegmentMarkerPayload;
+  } catch (e) {
+    return null;
+  }
+};
+
+const markerOverlapsSegment = (
+  payload: SegmentMarkerPayload,
+  segment: SegmentDescriptor,
+): boolean => {
+  if (payload.segment.segmentId === segment.segmentId) {
+    return true;
+  }
+  const payloadStart = parseTicks(payload.segment.startTicks);
+  const payloadEnd = parseTicks(payload.segment.endTicks);
+  const segmentStart = parseTicks(segment.startTicks);
+  const segmentEnd = parseTicks(segment.endTicks);
+  return payloadStart < segmentEnd && payloadEnd > segmentStart;
+};
+
+const deleteMarkerBestEffort = (seq: Sequence, marker: Marker): void => {
+  try {
+    //@ts-ignore
+    if (seq.markers.deleteMarker) {
+      //@ts-ignore
+      seq.markers.deleteMarker(marker);
+      return;
+    }
+  } catch (e) {
+    // ignore
+  }
+  try {
+    //@ts-ignore
+    if (seq.markers.removeMarker) {
+      //@ts-ignore
+      seq.markers.removeMarker(marker);
+    }
+  } catch (e2) {
+    // ignore
+  }
+};
+
+const ensurePayload = (payload: SegmentMarkerPayload): SegmentMarkerPayload => {
+  const now = String(new Date().getTime());
+  const segment: SegmentDescriptor = {
+    segmentId: payload.segment.segmentId,
+    startTicks: payload.segment.startTicks,
+    endTicks: payload.segment.endTicks,
+    ticksPerFrame: payload.segment.ticksPerFrame,
+    numFrames: payload.segment.numFrames,
+    trackIndex: payload.segment.trackIndex,
+    clipName: payload.segment.clipName,
+  };
+  const masks = payload.masks ? payload.masks : [];
+  return {
+    kind: FACE_BLUR_MARKER_KIND as "face-blur-segment",
+    schemaVersion: FACE_BLUR_MARKER_SCHEMA_VERSION as 1,
+    segment,
+    pngDir: payload.pngDir,
+    masks,
+    createdAt: payload.createdAt || now,
+    updatedAt: now,
+  };
+};
+
+const markerStartSeconds = (startTicks: string): number => {
+  return ticksToSeconds(startTicks);
+};
+
+const markerEndSeconds = (endTicks: string): number => {
+  return ticksToSeconds(endTicks);
+};
+
+/**
+ * Upserts an owned marker for a segment and replaces overlapping owned markers.
+ */
+export const upsertSegmentMarker = (
+  rawPayload: SegmentMarkerPayload,
+):
+  | {
+      markerGuid: string;
+      replacedCount: number;
+    }
+  | string => {
+  try {
+    if (!app.project.activeSequence) return "No active sequence found.";
+    const seq = app.project.activeSequence;
+    const payload = ensurePayload(rawPayload);
+    if (!payload.segment || !payload.segment.segmentId) {
+      return "Invalid marker payload: segment is required.";
+    }
+
+    const markersToReplace: Marker[] = [];
+    let marker = seq.markers.getFirstMarker();
+    while (marker) {
+      const parsed = parsePayloadFromMarker(marker);
+      if (parsed && markerOverlapsSegment(parsed, payload.segment)) {
+        markersToReplace.push(marker);
+      }
+      marker = seq.markers.getNextMarker(marker);
+    }
+
+    let target: Marker | null = null;
+    if (markersToReplace.length > 0) {
+      target = markersToReplace[0];
+      for (let i = 1; i < markersToReplace.length; i++) {
+        deleteMarkerBestEffort(seq, markersToReplace[i]);
+      }
+    }
+
+    if (!target) {
+      //@ts-ignore TS defs are incomplete for marker create overload
+      target = seq.markers.createMarker(
+        markerStartSeconds(payload.segment.startTicks),
+      );
+    }
+    if (!target) {
+      return "Failed to create or resolve marker.";
+    }
+
+    target.name = FACE_BLUR_MARKER_NAME_PREFIX + payload.segment.segmentId;
+    target.comments = JSON.stringify(payload);
+    //@ts-ignore Marker.end expects seconds value
+    target.end = markerEndSeconds(payload.segment.endTicks);
+
+    return {
+      markerGuid: target.guid,
+      replacedCount: markersToReplace.length,
+    };
+  } catch (e: any) {
+    return `Error in upsertSegmentMarker: ${e.toString()}`;
+  }
+};
+
+/**
+ * Returns the owned segment marker at CTI, if any.
+ */
+export const findOwnedMarkerAtCTI = ():
+  | {
+      found: false;
+    }
+  | {
+      found: true;
+      markerGuid: string;
+      payload: SegmentMarkerPayload;
+    }
+  | string => {
+  try {
+    if (!app.project.activeSequence) return "No active sequence found.";
+    const seq = app.project.activeSequence;
+    const ctiTicks = parseInt(seq.getPlayerPosition().ticks, 10);
+    if (!isFinite(ctiTicks)) return "Unable to resolve CTI ticks.";
+
+    let marker = seq.markers.getFirstMarker();
+    while (marker) {
+      const payload = parsePayloadFromMarker(marker);
+      if (payload) {
+        const start = parseTicks(payload.segment.startTicks);
+        const end = parseTicks(payload.segment.endTicks);
+        if (ctiTicks >= start && ctiTicks < end) {
+          return {
+            found: true,
+            markerGuid: marker.guid,
+            payload,
+          };
+        }
+      }
+      marker = seq.markers.getNextMarker(marker);
+    }
+    return { found: false };
+  } catch (e: any) {
+    return `Error in findOwnedMarkerAtCTI: ${e.toString()}`;
   }
 };
 

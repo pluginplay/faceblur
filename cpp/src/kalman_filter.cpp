@@ -27,14 +27,11 @@ inline void warp_point_px(const Mat3f& M, float x, float y, float& ox, float& oy
     oy = ny / d;
 }
 
-inline BBox warp_bbox_norm(const BBox& b_norm, const Mat3f& M, int w, int h) {
-    if (w <= 0 || h <= 0) return b_norm;
-
-    const float x1 = b_norm.x1 * static_cast<float>(w);
-    const float y1 = b_norm.y1 * static_cast<float>(h);
-    const float x2 = b_norm.x2 * static_cast<float>(w);
-    const float y2 = b_norm.y2 * static_cast<float>(h);
-
+inline BBox warp_bbox_px(const BBox& b, const Mat3f& M) {
+    const float x1 = b.x1;
+    const float y1 = b.y1;
+    const float x2 = b.x2;
+    const float y2 = b.y2;
     float px[4], py[4];
     warp_point_px(M, x1, y1, px[0], py[0]);
     warp_point_px(M, x2, y1, px[1], py[1]);
@@ -54,9 +51,7 @@ inline BBox warp_bbox_norm(const BBox& b_norm, const Mat3f& M, int w, int h) {
     if (maxx < minx) std::swap(maxx, minx);
     if (maxy < miny) std::swap(maxy, miny);
 
-    const float inv_w = 1.0f / static_cast<float>(w);
-    const float inv_h = 1.0f / static_cast<float>(h);
-    return BBox{minx * inv_w, miny * inv_h, maxx * inv_w, maxy * inv_h};
+    return BBox{minx, miny, maxx, maxy};
 }
 }  // namespace
 
@@ -234,26 +229,6 @@ Matrix Matrix::inverse() const {
     }
     
     return inv;
-}
-
-// =============================================================================
-// BBox Implementation
-// =============================================================================
-
-float BBox::iou(const BBox& other) const {
-    float ix1 = std::max(x1, other.x1);
-    float iy1 = std::max(y1, other.y1);
-    float ix2 = std::min(x2, other.x2);
-    float iy2 = std::min(y2, other.y2);
-    
-    if (ix2 < ix1 || iy2 < iy1) {
-        return 0.0f;
-    }
-    
-    float intersection = (ix2 - ix1) * (iy2 - iy1);
-    float union_area = area() + other.area() - intersection;
-    
-    return union_area > 0 ? intersection / union_area : 0.0f;
 }
 
 // =============================================================================
@@ -473,9 +448,9 @@ BBox KalmanBoxTracker::getState() const {
 void KalmanBoxTracker::applyWarp(const Mat3f& warp, int frame_width, int frame_height) {
     if (frame_width <= 0 || frame_height <= 0) return;
 
-    // Warp current KF state bbox (normalized), then rewrite (x,y,s,r).
+    // Warp current KF state bbox (pixel), then rewrite (x,y,s,r).
     const BBox cur = getState();
-    const BBox warped = warp_bbox_norm(cur, warp, frame_width, frame_height);
+    const BBox warped = warp_bbox_px(cur, warp);
     const Measurement z = bboxToMeasurement(warped);
     x_(0, 0) = z[0];
     x_(1, 0) = z[1];
@@ -483,12 +458,12 @@ void KalmanBoxTracker::applyWarp(const Mat3f& warp, int frame_width, int frame_h
     x_(3, 0) = z[3];
 
     // Approximate velocity transform using affine part (ignore projective terms).
-    const float vx_px = x_(4, 0) * static_cast<float>(frame_width);
-    const float vy_px = x_(5, 0) * static_cast<float>(frame_height);
+    const float vx_px = x_(4, 0);
+    const float vy_px = x_(5, 0);
     const float nvx_px = warp(0, 0) * vx_px + warp(0, 1) * vy_px;
     const float nvy_px = warp(1, 0) * vx_px + warp(1, 1) * vy_px;
-    x_(4, 0) = nvx_px / static_cast<float>(frame_width);
-    x_(5, 0) = nvy_px / static_cast<float>(frame_height);
+    x_(4, 0) = nvx_px;
+    x_(5, 0) = nvy_px;
 
     // Scale vs by local area scale (determinant of 2x2 affine part).
     const float detA = warp(0, 0) * warp(1, 1) - warp(0, 1) * warp(1, 0);
@@ -498,18 +473,18 @@ void KalmanBoxTracker::applyWarp(const Mat3f& warp, int frame_width, int frame_h
 
     // Transport observation state forward as well (OCR/OCM/ORU benefit from GMC).
     if (last_observation_.has_value() && last_observation_->score >= 0.0f) {
-        last_observation_->bbox = warp_bbox_norm(last_observation_->bbox, warp, frame_width, frame_height);
+        last_observation_->bbox = warp_bbox_px(last_observation_->bbox, warp);
     }
     for (auto& kv : observations_by_age_) {
         if (kv.second.score >= 0.0f) {
-            kv.second.bbox = warp_bbox_norm(kv.second.bbox, warp, frame_width, frame_height);
+            kv.second.bbox = warp_bbox_px(kv.second.bbox, warp);
         }
     }
 
     for (auto& opt : oru_history_) {
         if (!opt.has_value()) continue;
         const BBox hb = measurementToBbox(*opt);
-        const BBox hw = warp_bbox_norm(hb, warp, frame_width, frame_height);
+        const BBox hw = warp_bbox_px(hb, warp);
         *opt = bboxToMeasurement(hw);
     }
 
@@ -517,7 +492,7 @@ void KalmanBoxTracker::applyWarp(const Mat3f& warp, int frame_width, int frame_h
         // Keep ORU rollback state in the same (camera-compensated) coordinate system.
         Measurement saved = {(*oru_saved_x_)(0, 0), (*oru_saved_x_)(1, 0), (*oru_saved_x_)(2, 0), (*oru_saved_x_)(3, 0)};
         const BBox sb = measurementToBbox(saved);
-        const BBox sw = warp_bbox_norm(sb, warp, frame_width, frame_height);
+        const BBox sw = warp_bbox_px(sb, warp);
         const Measurement zs = bboxToMeasurement(sw);
         (*oru_saved_x_)(0, 0) = zs[0];
         (*oru_saved_x_)(1, 0) = zs[1];

@@ -45,7 +45,7 @@ const config: CEP_Config = {
       "http://timestamp.digicert.com/", // Windows Only
       "http://timestamp.apple.com/ts01", // MacOS Only
     ],
-    allowSkipTSA: false,
+    allowSkipTSA: true,
     sourceMap: false,
     jsxBin: "off",
   },

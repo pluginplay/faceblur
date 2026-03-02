@@ -18,22 +18,36 @@ import { bboxToMaskPoints } from "../faceDetection";
 // Re-export types
 export type { MogrtMaskPathResult } from "./types";
 
-// Time constants per Adobe ExtendScript Time:
-// 254,016,000,000 ticks per second; 48kHz audio sample => 5,292,000 ticks/sample
-const TICKS_PER_SECOND = 254016000000;
-const AUDIO_SAMPLE_TICKS = Math.floor(TICKS_PER_SECOND / 48000); // 5,292,000
+// Time constants per Adobe ExtendScript Time.
+const TICKS_PER_SECOND = 254016000000n;
 // Many AE/MOGRT templates start comp time at 01:00:00:00; native XML keyframes
 // are typically around this base. Anchor generated keyframes to this base time.
-const COMP_BASE_TICKS = 914457600000000; // 01:00:00:00
+const COMP_BASE_TICKS = 914457600000000n; // 01:00:00:00
 
-const snapToFrame = (ticks: number, ticksPerFrame: number) => {
-  const frames = Math.round(ticks / ticksPerFrame);
-  return frames * ticksPerFrame;
+const getFrameAlignedBaseTicks = (ticksPerFrame: bigint): bigint => {
+  // COMP_BASE_TICKS is exact for integer rates (24/25/30/60) but can be off-grid
+  // for fractional rates (e.g. 29.97). Snap to nearest frame boundary.
+  const remainder = COMP_BASE_TICKS % ticksPerFrame;
+  if (remainder === 0n) return COMP_BASE_TICKS;
+  const lower = COMP_BASE_TICKS - remainder;
+  const upper = lower + ticksPerFrame;
+  return remainder * 2n < ticksPerFrame ? lower : upper;
 };
 
-const withAudioForwardBias = (ticks: number) => {
-  // Bias forward by one audio sample to avoid rounding down across frame boundaries
-  return ticks + AUDIO_SAMPLE_TICKS;
+const toFrameAlignedTicks = (frameIndex: number, ticksPerFrame: string): string => {
+  if (!Number.isFinite(frameIndex)) {
+    throw new Error(`Invalid frame index '${frameIndex}' for keyframe generation`);
+  }
+  const roundedFrameIndex = Math.round(frameIndex);
+  if (roundedFrameIndex < 0) {
+    throw new Error(`Negative frame index '${roundedFrameIndex}' is not supported`);
+  }
+  const tpf = BigInt(ticksPerFrame);
+  if (tpf <= 0n) {
+    throw new Error(`Invalid ticksPerFrame '${ticksPerFrame}'`);
+  }
+  const baseTicks = getFrameAlignedBaseTicks(tpf);
+  return (baseTicks + BigInt(roundedFrameIndex) * tpf).toString();
 };
 
 /**
@@ -179,7 +193,6 @@ const createMorphingMaskPoints = (
  * Updates a mask path parameter to use keyframes instead of static values
  * @param maskPathParam The ArbVideoComponentParam element for the mask path
  * @param base64Value The base64-encoded mask path data
- * @param ctiTicks The CTI ticks as string
  * @param ticksPerFrame The ticks per frame as string
  * @param animate Whether to create multiple animated keyframes
  * @param originalPoints Original mask points for animation generation
@@ -187,7 +200,6 @@ const createMorphingMaskPoints = (
 const updateMaskPathWithKeyframes = (
   maskPathParam: Element,
   base64Value: string,
-  ctiTicks: string,
   ticksPerFrame: string,
   animate: boolean = false,
   originalPoints?: MaskPoint[]
@@ -228,21 +240,18 @@ const updateMaskPathWithKeyframes = (
   if (animate && originalPoints) {
     // Create animated keyframes over ~2 seconds, aligned to frame boundaries
     const animationFrames = 8; // 8 keyframes over ~2 seconds
-    const tpf = parseInt(ticksPerFrame, 10);
-    const totalTicks = 2 * TICKS_PER_SECOND; // strictly 2 seconds
-    const totalFrames = Math.max(1, Math.round(totalTicks / tpf));
+    const tpf = BigInt(ticksPerFrame);
+    const baseTicks = getFrameAlignedBaseTicks(tpf);
+    const totalTicks = 2n * TICKS_PER_SECOND; // strictly 2 seconds
+    const totalFrames = Math.max(1, Math.round(Number(totalTicks / tpf)));
     const stepFrames = Math.max(
       1,
       Math.round(totalFrames / (animationFrames - 1))
     );
-    const ticksPerKeyframe = stepFrames * tpf;
 
     const keyframePairs: string[] = [];
     for (let i = 0; i < animationFrames; i++) {
-      // Use layer-relative time; start at 0, snap and bias to avoid rounding issues
-      const rawTicks = i * ticksPerKeyframe;
-      const snapped = snapToFrame(rawTicks, tpf);
-      const frameTicks = COMP_BASE_TICKS + withAudioForwardBias(snapped);
+      const frameTicks = (baseTicks + BigInt(i * stepFrames) * tpf).toString();
       let frameBase64 = base64Value;
 
       if (i > 0) {
@@ -260,14 +269,9 @@ const updateMaskPathWithKeyframes = (
     }
     keyframesText = keyframePairs.join(";") + ";";
   } else {
-    // Static keyframes at layer start (0) and +1 frame, aligned and forward-biased
-    const tpf = parseInt(ticksPerFrame, 10);
-    const t0 = (
-      COMP_BASE_TICKS + withAudioForwardBias(snapToFrame(0, tpf))
-    ).toString();
-    const t1 = (
-      COMP_BASE_TICKS + withAudioForwardBias(snapToFrame(tpf, tpf))
-    ).toString();
+    // Static keyframes at layer start (0) and +1 frame, aligned to exact frame ticks
+    const t0 = toFrameAlignedTicks(0, ticksPerFrame);
+    const t1 = toFrameAlignedTicks(1, ticksPerFrame);
     keyframesText = `${t0},${base64Value};${t1},${base64Value};`;
   }
 
@@ -503,12 +507,12 @@ export const updateXmlMaskPathsOrAdd = async (
     throw new Error(`Failed to parse XML: ${parseError.textContent}`);
   }
 
-  // Get CTI ticks and ticks per frame from Premiere
+  // Get ticks per frame from Premiere
   const timeInfo = await evalTS("getCTITicksAndTicksPerFrame");
   if (typeof timeInfo === "string") {
     throw new Error(`Failed to get CTI time info: ${timeInfo}`);
   }
-  const { ctiTicks, ticksPerFrame } = timeInfo;
+  const { ticksPerFrame } = timeInfo;
 
   const existing = findGaussianBlurMaskTuples(xmlDoc);
   const componentsContainer = getVideoComponentChainComponents(xmlDoc);
@@ -538,7 +542,6 @@ export const updateXmlMaskPathsOrAdd = async (
         updateMaskPathWithKeyframes(
           tuple.maskPathParam,
           spec.base64,
-          ctiTicks,
           ticksPerFrame,
           spec.animate,
           spec.points
@@ -586,7 +589,6 @@ export const updateXmlMaskPathsOrAdd = async (
           updateMaskPathWithKeyframes(
             cloned.newMaskPathParam,
             spec.base64,
-            ctiTicks,
             ticksPerFrame,
             spec.animate,
             spec.points
@@ -643,6 +645,82 @@ const createTinyMaskPath = (): MaskPoint[] => {
   ];
 };
 
+const HIDDEN_TINY_EPSILON = 0.002;
+
+const isMaskHidden = (points: MaskPoint[]): boolean => {
+  if (!points || points.length === 0) return true;
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const p of points) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+      continue;
+    }
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+
+  if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) {
+    return true;
+  }
+
+  const width = maxX - minX;
+  const height = maxY - minY;
+  const tinyInvisible = width <= HIDDEN_TINY_EPSILON && height <= HIDDEN_TINY_EPSILON;
+  if (tinyInvisible) {
+    return true;
+  }
+
+  const fullyOutsideFrame = maxX <= 0 || minX >= 1 || maxY <= 0 || minY >= 1;
+  return fullyOutsideFrame;
+};
+
+const compressHiddenRuns = (
+  keyframes: Array<{ ticks: string; base64: string; hidden: boolean }>
+): Array<{ ticks: string; base64: string }> => {
+  if (keyframes.length <= 2) {
+    return keyframes.map(({ ticks, base64 }) => ({ ticks, base64 }));
+  }
+
+  const out: Array<{ ticks: string; base64: string }> = [];
+  let i = 0;
+  while (i < keyframes.length) {
+    const curr = keyframes[i];
+    if (!curr.hidden) {
+      out.push({ ticks: curr.ticks, base64: curr.base64 });
+      i++;
+      continue;
+    }
+
+    let j = i;
+    while (
+      j + 1 < keyframes.length &&
+      keyframes[j + 1].hidden &&
+      keyframes[j + 1].base64 === curr.base64
+    ) {
+      j++;
+    }
+
+    // Always keep first hidden frame to move mask off-screen.
+    out.push({ ticks: curr.ticks, base64: curr.base64 });
+
+    // If a visible frame follows this hidden run, keep one extra hidden hold keyframe.
+    const hasVisibleAfter = j + 1 < keyframes.length && !keyframes[j + 1].hidden;
+    if (hasVisibleAfter && j > i) {
+      out.push({ ticks: keyframes[j].ticks, base64: keyframes[j].base64 });
+    }
+
+    i = j + 1;
+  }
+
+  return out;
+};
+
 /**
  * Build and import a MOGRT from tracked masks with explicit per-frame keyframes.
  * Fills in missing frames with tiny masks to prevent masks from "hanging around".
@@ -658,6 +736,7 @@ export const buildAndImportMogrtFromTracks = async (
     xmlPath?: string;
     ticksPerFrame: string;
     timeInTicks?: string;
+    endTicks?: string;
     videoTrackOffset?: number;
     audioTrackOffset?: number;
     numFrames?: number; // Total number of frames in the sequence
@@ -670,11 +749,8 @@ export const buildAndImportMogrtFromTracks = async (
       return `XML file not found: ${xmlFilePath}`;
     }
 
-    const tpf = parseInt(opts.ticksPerFrame, 10);
     const toTicks = (frameIndex: number) =>
-      (
-        COMP_BASE_TICKS + withAudioForwardBias(snapToFrame(frameIndex * tpf, tpf))
-      ).toString();
+      toFrameAlignedTicks(frameIndex, opts.ticksPerFrame);
 
     // Determine the frame range
     // Find min and max frame indices across all tracks
@@ -708,26 +784,30 @@ export const buildAndImportMogrtFromTracks = async (
         frameMap.set(f.frameIndex, f.points);
       });
 
-      // Create keyframes for all frames in the range
-      const keyframes: Array<{ ticks: string; base64: string }> = [];
+      // Create keyframes for all frames in the range, then collapse long hidden spans.
+      const frameKeyframes: Array<{ ticks: string; base64: string; hidden: boolean }> = [];
       const tinyMaskBase64 = encodeMaskPathToBase64(createTinyMaskPath());
 
       for (let frameIndex = startFrame; frameIndex <= endFrame; frameIndex++) {
         const points = frameMap.get(frameIndex);
         if (points) {
           // Use actual detection points
-          keyframes.push({
+          frameKeyframes.push({
             ticks: toTicks(frameIndex),
             base64: encodeMaskPathToBase64(points),
+            hidden: isMaskHidden(points),
           });
         } else {
           // Fill with tiny mask for frames without detection
-          keyframes.push({
+          frameKeyframes.push({
             ticks: toTicks(frameIndex),
             base64: tinyMaskBase64,
+            hidden: true,
           });
         }
       }
+
+      const keyframes = compressHiddenRuns(frameKeyframes);
 
       // Fallback: if no frames at all, create at least one keyframe
       if (keyframes.length === 0) {
@@ -751,6 +831,7 @@ export const buildAndImportMogrtFromTracks = async (
       "importModifiedMogrt",
       mogrtPath,
       opts.timeInTicks,
+      opts.endTicks,
       opts.videoTrackOffset ?? 1,
       opts.audioTrackOffset ?? 0
     );
@@ -814,6 +895,7 @@ export const modifyAndBuildMogrt = async (
 export const buildAndImportMogrtMulti = async (
   xmlPath?: string,
   timeInTicks?: string,
+  endTicks?: string,
   videoTrackOffset: number = 1,
   audioTrackOffset: number = 0,
   masks: MaskSpec[] = []
@@ -852,6 +934,7 @@ export const buildAndImportMogrtMulti = async (
       "importModifiedMogrt",
       mogrtPath,
       timeInTicks,
+      endTicks,
       videoTrackOffset,
       audioTrackOffset
     );
@@ -877,6 +960,7 @@ export const buildAndImportMogrtMulti = async (
 export const buildAndImportMogrt = async (
   xmlPath?: string,
   timeInTicks?: string,
+  endTicks?: string,
   videoTrackOffset: number = 1,
   audioTrackOffset: number = 0,
   points?: MaskPoint[]
@@ -914,6 +998,7 @@ export const buildAndImportMogrt = async (
       "importModifiedMogrt",
       mogrtPath,
       timeInTicks,
+      endTicks,
       videoTrackOffset,
       audioTrackOffset
     );
