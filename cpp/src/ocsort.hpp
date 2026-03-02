@@ -1,10 +1,11 @@
 #pragma once
 
+#include "core/types.hpp"
 #include "kalman_filter.hpp"
 #include "hungarian.hpp"
 
-#include <map>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 /**
@@ -13,6 +14,7 @@
 struct TrackResult {
     BBox bbox;
     float confidence;
+    int time_since_update = 0;
 };
 
 /**
@@ -49,7 +51,13 @@ public:
            float inertia = 0.2f,
            bool use_reid = false,
            float reid_weight = 0.35f,
-           float reid_cos_thresh = 0.35f);
+           float reid_cos_thresh = 0.35f,
+           float rescue_iou_thresh = 0.05f,
+           float assoc_max_center_dist = 1.25f,
+           float assoc_max_area_ratio = 4.0f,
+           float assoc_dist_weight = 0.08f,
+           float assoc_area_weight = 0.04f,
+           int max_return_pred_age = 15);
     
     /**
      * Update tracker with new detections.
@@ -61,11 +69,11 @@ public:
      * @param frame_height Pixel height of current frame (required if warp provided)
      * @return Map of track_id -> TrackResult for confirmed tracks
      */
-    std::map<int, TrackResult> update(const std::vector<Detection>& detections,
-                                       bool return_all = false,
-                                       const Mat3f* warp_prev_to_curr = nullptr,
-                                       int frame_width = 0,
-                                       int frame_height = 0);
+    std::unordered_map<int, TrackResult> update(const std::vector<Detection>& detections,
+                                                bool return_all = false,
+                                                const Mat3f* warp_prev_to_curr = nullptr,
+                                                int frame_width = 0,
+                                                int frame_height = 0);
     
     /**
      * Reset tracker state (call at scene boundaries).
@@ -78,7 +86,7 @@ public:
     size_t numTrackers() const { return trackers_.size(); }
 
     // Appearance summaries for offline tracklet linking.
-    using AppearanceMap = std::map<int, std::array<float, Detection::kReidDim>>;
+    using AppearanceMap = std::unordered_map<int, Appearance>;
     AppearanceMap takeFinishedAppearances();     // drains
     AppearanceMap getActiveAppearances() const;  // snapshot
 
@@ -93,6 +101,12 @@ private:
     bool use_reid_ = false;
     float reid_weight_ = 0.35f;       // how much to trust appearance vs motion/IoU
     float reid_cos_thresh_ = 0.35f;   // cosine similarity gate for low-IoU matches
+    float rescue_iou_thresh_ = 0.05f;
+    float assoc_max_center_dist_ = 1.25f;
+    float assoc_max_area_ratio_ = 4.0f;
+    float assoc_dist_weight_ = 0.08f;
+    float assoc_area_weight_ = 0.04f;
+    int max_return_pred_age_ = 15;
     
     std::vector<std::unique_ptr<KalmanBoxTracker>> trackers_;
     int next_id_ = 0;

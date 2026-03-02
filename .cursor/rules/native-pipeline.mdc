@@ -1,0 +1,36 @@
+---
+description: C++ ML pipeline setup, build, and deploy
+globs: "{cpp/**,scripts/*native*,scripts/setup_onnx*}"
+alwaysApply: false
+---
+
+# Native Face Pipeline
+
+## Bundle layout
+
+- `src/bin/face_pipeline` — executable
+- `src/bin/lib/*.dylib` — macOS runtime libs (`@executable_path/lib`)
+- `src/bin/models/` — ONNX models (SCRFD, RF-DETR, optional OSNet)
+
+## Build flow (macOS)
+
+1. `yarn build:native` — CMake + compile (`-DFACE_PIPELINE_ENABLE_GMC=OFF` by default)
+2. `yarn stage:native:mac` — install to `src/bin`, run `scripts/stage-native-macos.sh` (collect dylibs -> `lib/`, rewrite install names, ad-hoc sign)
+3. `yarn build` — CEP-only build; precheck validates native bundle
+4. `yarn zxp` — runs `verify:native` first, then packages
+
+## Key scripts
+
+- `scripts/stage-native-macos.sh <exe> <out_dir>` — bundles dylibs into `out_dir/lib`, relinks to `@executable_path/lib/`, codesigns
+- `scripts/verify-native-bundle.mjs` — checks `src/bin` structure
+- `scripts/setup_onnx_models.sh` — fetches/copies ONNX models into `src/bin/models`
+
+## GMC
+
+- Default: translation-only fallback (no OpenCV)
+- OpenCV GMC: `-DFACE_PIPELINE_ENABLE_GMC=ON` in CMake, `brew install opencv` — adds many dylibs
+
+## Runtime
+
+- CEP/Node spawns `face_pipeline`, passes frame paths via stdin
+- `DYLD_LIBRARY_PATH` includes `bin` and `bin/lib` on macOS

@@ -1,6 +1,6 @@
 import { defineConfig } from "vite";
 
-import react from "@vitejs/plugin-react"; 
+import react from "@vitejs/plugin-react";
 
 import { cep, runAction } from "vite-cep-plugin";
 import cepConfig from "./cep.config";
@@ -27,6 +27,35 @@ let input = {};
 cepConfig.panels.map((panel) => {
   input[panel.name] = path.resolve(root, panel.mainPath);
 });
+const panelNames = new Set(cepConfig.panels.map((panel) => panel.name));
+
+const appsPathCompatPlugin = () => ({
+  name: "apps-path-compat",
+  configureServer(server) {
+    server.middlewares.use((req, _res, next) => {
+      if (!req.url) {
+        next();
+        return;
+      }
+
+      const [pathname, search = ""] = req.url.split("?");
+      const match = pathname.match(/^\/apps\/([^/]+)(\/.*)?$/);
+      if (!match) {
+        next();
+        return;
+      }
+
+      const [, panelName, suffix = "/"] = match;
+      if (!panelNames.has(panelName)) {
+        next();
+        return;
+      }
+
+      req.url = `/${panelName}${suffix}${search ? `?${search}` : ""}`;
+      next();
+    });
+  },
+});
 
 const config = {
   cepConfig,
@@ -47,7 +76,8 @@ if (action) runAction(config, action);
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
-    react(), 
+    // appsPathCompatPlugin(),
+    react(),
     cep(config),
   ],
   resolve: {

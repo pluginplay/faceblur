@@ -5,32 +5,43 @@ project(face_pipeline LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(FACE_PIPELINE_ENABLE_GMC "Enable Global Motion Compensation (requires OpenCV videostab)" ON)
+option(FACE_PIPELINE_ENABLE_GMC "Enable OpenCV-backed GMC (dependency-heavy on macOS)" OFF)
 
 if(APPLE)
   if(NOT DEFINED CMAKE_OSX_ARCHITECTURES)
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build universal binary")
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Build architecture")
   endif()
   set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 endif()
 
-set(NCNN_INSTALL_DIR
-    "${CMAKE_SOURCE_DIR}/third_party/ncnn-master/build/install"
-    CACHE PATH "Path to ncnn install prefix"
-)
-
-list(APPEND CMAKE_PREFIX_PATH "${NCNN_INSTALL_DIR}")
-find_package(ncnn REQUIRED)
+find_package(onnxruntime REQUIRED CONFIG)
+if(NOT TARGET onnxruntime::onnxruntime)
+  if(TARGET onnxruntime)
+    add_library(onnxruntime::onnxruntime INTERFACE IMPORTED)
+    target_link_libraries(onnxruntime::onnxruntime INTERFACE onnxruntime)
+  else()
+    message(FATAL_ERROR "onnxruntime package found but no usable CMake target exported")
+  endif()
+endif()
 
 # Main face pipeline executable (detection + tracking)
 add_executable(face_pipeline
   src/main.cpp
+  src/io/frame_source.cpp
+  src/associate/face_person_associator.cpp
+  src/detect/face_detector.cpp
+  src/detect/person_detector.cpp
+  src/reid/body_reid_extractor.cpp
+  src/link/tracklet_linker.cpp
+  src/infer/ort_runtime.cpp
+  src/infer/image_ops.cpp
   src/scrfd.cpp
-  src/reid.cpp
   src/kalman_filter.cpp
   src/hungarian.cpp
   src/ocsort.cpp
   src/gmc.cpp
+  src/pipeline/adapters.cpp
+  src/pipeline/pipeline_runner.cpp
   src/pipeline.cpp
   src/stb_impl.cpp
 )
@@ -40,14 +51,9 @@ target_include_directories(face_pipeline PRIVATE
   "${CMAKE_SOURCE_DIR}/src"
 )
 
-target_link_libraries(face_pipeline PRIVATE ncnn)
+target_link_libraries(face_pipeline PRIVATE onnxruntime::onnxruntime)
 
 if(FACE_PIPELINE_ENABLE_GMC)
-  # Always compile a lightweight dependency-free GMC fallback. If OpenCV videostab
-  # is available we'll prefer that backend at runtime, but universal builds can
-  # still benefit from the fallback.
-  target_compile_definitions(face_pipeline PRIVATE FACE_PIPELINE_GMC_FALLBACK=1)
-
   find_package(OpenCV QUIET COMPONENTS core imgproc video videostab)
   set(_gmc_opencv_ok OFF)
   if(OpenCV_FOUND)
@@ -80,7 +86,7 @@ endif()
 if(APPLE)
   set_target_properties(face_pipeline PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "@executable_path"
+    INSTALL_RPATH "@executable_path;@executable_path/lib"
   )
 endif()
 
@@ -88,14 +94,6 @@ install(TARGETS face_pipeline
   RUNTIME DESTINATION .
   BUNDLE DESTINATION .
 )
-
-if(APPLE)
-  # Copy the actual dylib and create proper symlinks for macOS bundle
-  file(GLOB NCNN_DYLIBS "${NCNN_INSTALL_DIR}/lib/libncnn*.dylib")
-  install(FILES ${NCNN_DYLIBS} DESTINATION .)
-elseif(WIN32)
-  install(FILES "${NCNN_INSTALL_DIR}/bin/ncnn.dll" DESTINATION .)
-endif()
 
 # Note: The old scrfd_cli functionality is now part of face_pipeline
 # Use: face_pipeline --model <dir> --image <path> for single image detection

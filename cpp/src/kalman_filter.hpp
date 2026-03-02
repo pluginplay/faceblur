@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 
+#include "core/types.hpp"
 #include "transform.hpp"
 
 /**
@@ -40,41 +41,6 @@ public:
 private:
     int rows_, cols_;
     std::vector<float> data_;
-};
-
-/**
- * Bounding box representation for tracking.
- */
-struct BBox {
-    float x1, y1, x2, y2;  // Coordinates (can be normalized or absolute)
-    
-    float width() const { return x2 - x1; }
-    float height() const { return y2 - y1; }
-    float centerX() const { return (x1 + x2) / 2.0f; }
-    float centerY() const { return (y1 + y2) / 2.0f; }
-    float area() const { return width() * height(); }
-    
-    // IoU calculation
-    float iou(const BBox& other) const;
-};
-
-/**
- * A detection input for tracking (bbox + confidence).
- *
- * Notes:
- * - `bbox` is geometry only (x1,y1,x2,y2)
- * - `score` is used to weight OCM costs and output confidence
- */
-struct Detection {
-    BBox bbox;
-    float score = 1.0f;
-
-    // Optional appearance embedding for ReID-enabled association.
-    // MobileFaceNet ArcFace checkpoint in this repo outputs 128-D.
-    static constexpr int kReidDim = 128;
-    std::array<float, kReidDim> reid{};
-    bool has_reid = false;
-    float reid_quality = 0.0f;  // [0,1], used to keep only high-quality samples
 };
 
 /**

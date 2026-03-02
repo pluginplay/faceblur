@@ -3,14 +3,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "core/config.hpp"
 #include "transform.hpp"
-
-struct GmcConfig {
-    enum class Model { Similarity, Homography };
-
-    int downscale = 4;
-    Model model = Model::Similarity;
-};
 
 class GmcEstimator {
 public:
