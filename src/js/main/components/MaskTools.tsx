@@ -8,11 +8,11 @@ export function MaskTools({
   canApply,
 }: MaskToolsProps) {
   return (
-    <div className="flex gap-2 flex-wrap">
+    <div className="flex items-center gap-2">
       <button
         onClick={onApplyMasks}
         disabled={!canApply}
-        className="px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50 text-white text-sm font-medium rounded-md transition-colors shadow-sm"
+        className="s-button-cta min-w-[120px]"
       >
         Apply Masks
       </button>

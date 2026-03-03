@@ -147,7 +147,20 @@ def run_face_pipeline(
         Parsed JSON output, GMC info map, and profile metrics
     """
     script_dir = Path(__file__).parent.parent
-    executable_path = script_dir / "src" / "bin" / "face_pipeline"
+    if sys.platform == "darwin":
+        executable_path = (
+            script_dir
+            / "src"
+            / "bin"
+            / "face_pipeline.app"
+            / "Contents"
+            / "MacOS"
+            / "face_pipeline"
+        )
+    elif sys.platform == "win32":
+        executable_path = script_dir / "src" / "bin" / "face_pipeline.exe"
+    else:
+        executable_path = script_dir / "src" / "bin" / "face_pipeline"
     
     if not executable_path.exists():
         raise FileNotFoundError(f"face_pipeline executable not found at {executable_path}")
@@ -184,18 +197,7 @@ def run_face_pipeline(
     # Enable a single summary log line from the native pipeline (stderr).
     env["FACE_PIPELINE_LOG_GMC"] = "1"
     
-    if sys.platform == "darwin":
-        # macOS: include executable and bundled lib/ in dylib search path
-        existing_path = env.get("DYLD_LIBRARY_PATH", "")
-        bundle_paths = (
-            f"{executable_dir}:{executable_lib_dir}"
-            if Path(executable_lib_dir).exists()
-            else executable_dir
-        )
-        env["DYLD_LIBRARY_PATH"] = (
-            f"{bundle_paths}:{existing_path}" if existing_path else bundle_paths
-        )
-    elif sys.platform == "linux":
+    if sys.platform == "linux":
         # Linux: include executable and bundled lib/ in shared library search path
         existing_path = env.get("LD_LIBRARY_PATH", "")
         bundle_paths = (
@@ -638,8 +640,20 @@ def run_test(
     stage_wall_sec: Dict[str, float] = {}
 
     script_dir = Path(__file__).parent.parent
-    model_dir = str(script_dir / "src" / "bin" / "models")
-    body_reid_dir = str(script_dir / "src" / "bin" / "models" / "osnet_ibn_x1_0")
+    if sys.platform == "darwin":
+        model_root = (
+            script_dir
+            / "src"
+            / "bin"
+            / "face_pipeline.app"
+            / "Contents"
+            / "Resources"
+            / "models"
+        )
+    else:
+        model_root = script_dir / "src" / "bin" / "models"
+    model_dir = str(model_root)
+    body_reid_dir = str(model_root / "osnet_ibn_x1_0")
     
     # Ensure output directory exists early (used for tracking JSON + video)
     output_dir = Path(output_path).parent

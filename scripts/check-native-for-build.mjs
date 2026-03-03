@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,8 +15,9 @@ try {
     stdio: "inherit",
   });
 } catch {
+  const hostBuildCommand = os.platform() === "win32" ? "yarn build:win" : "yarn build:mac";
   console.error("");
   console.error("[build] Native bundle is missing or invalid for CEP build.");
-  console.error("[build] Run `yarn build:mac` first, then rerun `yarn build`.");
+  console.error(`[build] Run \`${hostBuildCommand}\` first, then rerun \`yarn build\`.`);
   process.exit(1);
 }

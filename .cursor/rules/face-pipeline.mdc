@@ -15,7 +15,7 @@ Adobe CEP extension for Premiere Pro with a native C++ face detection/tracking p
 - `src/js/` - React UI (CEP panel)
 - `src/jsx/` - ExtendScript (Premiere Pro)
 - `scripts/` - Python testing utilities
-- `src/bin/` - Bundled executable + models
+- `src/bin/` - Bundled native app payload + models
 
 ## C++ Pipeline
 
@@ -59,7 +59,7 @@ make -j4
 cmake --install . --prefix ../../src/bin
 ```
 
-**Requirements:** CMake 3.20+, C++17 compiler. Builds universal binary on macOS.
+**Requirements:** CMake 3.20+, C++17 compiler. Current local target is Apple Silicon (`arm64`) on macOS 15.5+.
 
 ## Testing with Python
 
@@ -80,7 +80,7 @@ python scripts/test_face_pipeline.py --video input.mp4 \
 **What it does:**
 
 1. Extracts video frames to temp dir
-2. Calls `src/bin/face_pipeline` with frame paths via stdin
+2. Calls `src/bin/face_pipeline.app/Contents/MacOS/face_pipeline` with frame paths via stdin
 3. Renders colored bboxes with track IDs onto output video
 
 **Python deps (dev-only):** `pip install -r requirements.txt` (opencv-python, numpy)
@@ -91,6 +91,10 @@ Located in `src/bin/models/`:
 
 - `scrfd.param` - Network architecture
 - `scrfd.bin` - Weights
+
+For mac app runtime/package verification, models are also mirrored under:
+
+- `src/bin/face_pipeline.app/Contents/Resources/models/`
 
 ## Video Analyzer MCP
 

@@ -19,56 +19,64 @@ export function MaskProperties({
   const feather = activeMask.feather ?? 10;
   const expansion = activeMask.expansion ?? 0;
 
+  const sliderRows = [
+    {
+      key: "blur",
+      label: "Blurriness",
+      min: 0,
+      max: 300,
+      value: blurriness,
+      onChange: onBlurrinessChange,
+    },
+    {
+      key: "feather",
+      label: "Feather",
+      min: 0,
+      max: 300,
+      value: feather,
+      onChange: onFeatherChange,
+    },
+    {
+      key: "expansion",
+      label: "Expansion",
+      min: -300,
+      max: 300,
+      value: expansion,
+      onChange: onExpansionChange,
+    },
+  ];
+
   return (
-    <div className="flex gap-4 items-center flex-wrap p-2 rounded-lg bg-gray-800/40 border border-gray-700/50">
-      <div className="flex items-center gap-2">
-        <label className="text-gray-300 text-xs font-medium min-w-[70px]">
-          Blurriness
-        </label>
-        <input
-          type="range"
-          min={0}
-          max={300}
-          step={1}
-          value={blurriness}
-          onChange={(e) => onBlurrinessChange(Number(e.target.value))}
-          className="w-32 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-orange-600"
-        />
-        <span className="text-gray-400 text-xs w-8 text-right">
-          {blurriness}
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <h2 className="s-panel-title">Mask Properties</h2>
+        <span className="px-1.5 py-0.5 s-text-caption font-normal text-[#a4acb8]">
+          {activeMask.name}
         </span>
       </div>
-      <div className="flex items-center gap-2">
-        <label className="text-gray-300 text-xs font-medium min-w-[70px]">
-          Feather
-        </label>
-        <input
-          type="range"
-          min={0}
-          max={300}
-          step={1}
-          value={feather}
-          onChange={(e) => onFeatherChange(Number(e.target.value))}
-          className="w-32 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-orange-600"
-        />
-        <span className="text-gray-400 text-xs w-8 text-right">{feather}</span>
-      </div>
-      <div className="flex items-center gap-2">
-        <label className="text-gray-300 text-xs font-medium min-w-[70px]">
-          Expansion
-        </label>
-        <input
-          type="range"
-          min={-300}
-          max={300}
-          step={1}
-          value={expansion}
-          onChange={(e) => onExpansionChange(Number(e.target.value))}
-          className="w-32 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-orange-600"
-        />
-        <span className="text-gray-400 text-xs w-8 text-right">
-          {expansion}
-        </span>
+      <div className="space-y-2">
+        {sliderRows.map((row) => (
+          <div
+            key={row.key}
+            className="grid grid-cols-[88px_minmax(0,1fr)_40px] items-center gap-3"
+          >
+            <label className="text-[13px] leading-tight font-medium text-[#ccd3dc]">
+              {row.label}
+            </label>
+            <input
+              type="range"
+              min={row.min}
+              max={row.max}
+              step={1}
+              value={row.value}
+              onChange={(e) => row.onChange(Number(e.target.value))}
+              className="s-slider"
+            />
+            <span className="text-right s-text-mono text-[#a3acb8]">
+              {row.value}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
