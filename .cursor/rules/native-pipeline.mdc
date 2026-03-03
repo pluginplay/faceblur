@@ -8,21 +8,28 @@ alwaysApply: false
 
 ## Bundle layout
 
-- `src/bin/face_pipeline` — executable
-- `src/bin/lib/*.dylib` — macOS runtime libs (`@executable_path/lib`)
-- `src/bin/models/` — ONNX models (SCRFD, RF-DETR, optional OSNet)
+- `src/bin/face_pipeline.app/Contents/MacOS/face_pipeline` — macOS executable
+- `src/bin/face_pipeline.app/Contents/Frameworks/*.dylib` — macOS runtime libs (`@executable_path/../Frameworks`)
+- `src/bin/face_pipeline.app/Contents/Resources/models/` — macOS ONNX models (SCRFD, RF-DETR, optional OSNet)
+- `src/bin/models/` — shared/Windows model root used in packaging
 
 ## Build flow (macOS)
 
 1. `yarn build:native` — CMake + compile (`-DFACE_PIPELINE_ENABLE_GMC=OFF` by default)
-2. `yarn stage:native:mac` — install to `src/bin`, run `scripts/stage-native-macos.sh` (collect dylibs -> `lib/`, rewrite install names, ad-hoc sign)
+2. `yarn stage:native:mac` — install to `src/bin`, run `scripts/stage-native-macos.sh` (emit `.app`, write `Info.plist`/`PkgInfo`, collect dylibs into `Contents/Frameworks`, rewrite install names, ad-hoc sign internals)
 3. `yarn build` — CEP-only build; precheck validates native bundle
 4. `yarn zxp` — runs `verify:native` first, then packages
 
+## Release flow (macOS, Gatekeeper compliant)
+
+- `yarn native:mac:release` — runs build + stage + verify + Developer ID sign + notarize + staple + Gatekeeper verification.
+- `yarn verify:mac:dist` — validates Developer ID authority, Team ID, hardened runtime, timestamp, `spctl` acceptance, and stapled ticket.
+
 ## Key scripts
 
-- `scripts/stage-native-macos.sh <exe> <out_dir>` — bundles dylibs into `out_dir/lib`, relinks to `@executable_path/lib/`, codesigns
+- `scripts/stage-native-macos.sh <exe> <out_dir>` — emits app bundle structure, relinks dylibs for `Contents/Frameworks`, and signs internals after install-name changes
 - `scripts/verify-native-bundle.mjs` — checks `src/bin` structure
+- `scripts/verify-macos-distribution.mjs` — checks Gatekeeper/notarization readiness
 - `scripts/setup_onnx_models.sh` — fetches/copies ONNX models into `src/bin/models`
 
 ## GMC
@@ -32,5 +39,5 @@ alwaysApply: false
 
 ## Runtime
 
-- CEP/Node spawns `face_pipeline`, passes frame paths via stdin
-- `DYLD_LIBRARY_PATH` includes `bin` and `bin/lib` on macOS
+- CEP/Node spawns `face_pipeline.app/Contents/MacOS/face_pipeline`, passes frame paths via stdin
+- No mac `DYLD_LIBRARY_PATH` requirement in app-bundle runtime path

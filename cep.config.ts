@@ -49,7 +49,16 @@ const config: CEP_Config = {
     sourceMap: false,
     jsxBin: "off",
   },
-  installModules: ["archiver"],
+  installModules: [
+    "archiver",
+    "process-nextick-args",
+    "core-util-is",
+    "isarray",
+    "process",
+    "buffer",
+    "events",
+    "abort-controller",
+  ],
   copyAssets: ["bin"],
   copyZipAssets: [],
 };

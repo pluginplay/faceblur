@@ -88,6 +88,11 @@ if(APPLE)
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "@executable_path;@executable_path/lib"
   )
+elseif(UNIX)
+  set_target_properties(face_pipeline PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN;$ORIGIN/lib"
+  )
 endif()
 
 install(TARGETS face_pipeline

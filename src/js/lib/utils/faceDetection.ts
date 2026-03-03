@@ -74,6 +74,10 @@ let _activePipelineProcess: ChildProcessWithoutNullStreams | null = null;
 let _activePipelineCancelled = false;
 const PROGRESS_PREFIX = "FB_PROGRESS ";
 const LOG_PREFIX = "[face_pipeline]";
+const PIPELINE_TIMEOUT_MS = 20 * 60 * 1000;
+const PIPELINE_STALL_TIMEOUT_MS = 90 * 1000;
+const MAX_STDOUT_BYTES = 5 * 1024 * 1024;
+const MAX_STDERR_BYTES = 2 * 1024 * 1024;
 
 type ProgressStage =
   | "startup"
@@ -173,10 +177,8 @@ function getPipelineExecutable(): string {
   const extRoot = getExtensionRoot();
   const platform = os.platform();
 
-  // Try common locations
-  const candidates: string[] = [];
-
   if (platform === "win32") {
+    const candidates: string[] = [];
     candidates.push(
       path.join(extRoot, "cpp", "build", "Release", "face_pipeline.exe"),
       path.join(extRoot, "cpp", "build", "face_pipeline.exe"),
@@ -185,28 +187,34 @@ function getPipelineExecutable(): string {
       // Repo/dev fallback
       path.join(extRoot, "src", "bin", "face_pipeline.exe")
     );
-  } else {
-    candidates.push(
-      path.join(extRoot, "cpp", "build", "face_pipeline"),
-      // Packaged CEP assets
-      path.join(extRoot, "bin", "face_pipeline"),
-      // Repo/dev fallback
-      path.join(extRoot, "src", "bin", "face_pipeline")
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+      } catch {
+        // continue
+      }
+    }
+    throw new Error(
+      `Face pipeline executable not found. Checked: ${candidates.join(", ")}`
     );
   }
 
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
-    } catch {
-      // continue
-    }
+  const appExecutable = path.join(
+    extRoot,
+    "bin",
+    "face_pipeline.app",
+    "Contents",
+    "MacOS",
+    "face_pipeline"
+  );
+  if (fs.existsSync(appExecutable)) {
+    return appExecutable;
   }
 
   throw new Error(
-    `Face pipeline executable not found. Checked: ${candidates.join(", ")}`
+    `Face pipeline executable not found at required macOS app path: ${appExecutable}`
   );
 }
 
@@ -215,32 +223,115 @@ function getPipelineExecutable(): string {
  */
 function getModelDir(): string {
   const extRoot = getExtensionRoot();
+  const platform = os.platform();
 
-  const candidates = [
-    path.join(extRoot, "bin", "models"),
-    // Repo/dev fallback
-    path.join(extRoot, "src", "bin", "models"),
-    path.join(extRoot, "cpp", "models"),
-    path.join(extRoot, "models"),
-  ];
+  if (platform === "win32") {
+    const candidates = [
+      path.join(extRoot, "bin", "models"),
+      // Repo/dev fallback
+      path.join(extRoot, "src", "bin", "models"),
+      path.join(extRoot, "cpp", "models"),
+      path.join(extRoot, "models"),
+    ];
 
-  for (const candidate of candidates) {
-    try {
-      const scrfdCandidates = [
-        path.join(candidate, "scrfd_2.5g_kps_640x640.onnx"),
-        path.join(candidate, "scrfd.onnx"),
-      ];
-      if (scrfdCandidates.some((p) => fs.existsSync(p))) {
-        return candidate;
+    for (const candidate of candidates) {
+      try {
+        const scrfdCandidates = [
+          path.join(candidate, "scrfd_2.5g_kps_640x640.onnx"),
+          path.join(candidate, "scrfd.onnx"),
+        ];
+        if (scrfdCandidates.some((p) => fs.existsSync(p))) {
+          return candidate;
+        }
+      } catch {
+        // continue
       }
-    } catch {
-      // continue
     }
+    throw new Error(
+      `SCRFD ONNX model file not found. Checked: ${candidates.join(", ")}`
+    );
   }
 
-  throw new Error(
-    `SCRFD ONNX model file not found. Checked: ${candidates.join(", ")}`
+  const macModelDir = path.join(
+    extRoot,
+    "bin",
+    "face_pipeline.app",
+    "Contents",
+    "Resources",
+    "models"
   );
+  if (fs.existsSync(path.join(macModelDir, "scrfd_2.5g_kps_640x640.onnx"))) {
+    return macModelDir;
+  }
+  throw new Error(
+    `SCRFD ONNX model file not found at required macOS app path: ${macModelDir}`
+  );
+}
+
+function requireNativeAssets(executable: string, modelDir: string) {
+  if (!fs.existsSync(executable)) {
+    throw new Error(`Native executable missing: ${executable}`);
+  }
+  if (os.platform() !== "win32") {
+    try {
+      fs.accessSync(executable, fs.constants.X_OK);
+    } catch {
+      throw new Error(`Native executable is not executable: ${executable}`);
+    }
+    const expectedMacSuffix = path.join(
+      "face_pipeline.app",
+      "Contents",
+      "MacOS",
+      "face_pipeline"
+    );
+    if (os.platform() === "darwin" && !executable.endsWith(expectedMacSuffix)) {
+      throw new Error(
+        `Invalid macOS native executable path. Expected .../${expectedMacSuffix}, got: ${executable}`
+      );
+    }
+    if (os.platform() === "darwin") {
+      const appContentsDir = path.resolve(executable, "..", "..");
+      const frameworksDir = path.join(appContentsDir, "Frameworks");
+      if (!fs.existsSync(frameworksDir)) {
+        throw new Error(
+          `Missing macOS app Frameworks directory: ${frameworksDir}`
+        );
+      }
+    }
+  }
+  const requiredModels = [
+    path.join(modelDir, "scrfd_2.5g_kps_640x640.onnx"),
+    path.join(modelDir, "rf_detr_small", "rf-detr-small.onnx"),
+  ];
+  const missing = requiredModels.filter((p) => !fs.existsSync(p));
+  if (missing.length > 0) {
+    throw new Error(`Missing required model file(s): ${missing.join(", ")}`);
+  }
+}
+
+function appendLimited(
+  current: string,
+  chunk: string,
+  maxBytes: number
+): string {
+  const next = current + chunk;
+  if (next.length <= maxBytes) return next;
+  return next.slice(next.length - maxBytes);
+}
+
+function getExitHint(exitCode: number | null): string {
+  switch (exitCode) {
+    case 1:
+      return "invalid native arguments";
+    case 2:
+      return "missing or unreadable model files";
+    case 3:
+      return "input frame read failure";
+    case 4:
+      return "inference runtime failure";
+    default:
+      return "native runtime error";
+  }
 }
 
 /**
@@ -267,6 +358,7 @@ function spawnPipeline(
 
     const executable = getPipelineExecutable();
     const modelDir = getModelDir();
+    requireNativeAssets(executable, modelDir);
     const startTime = Date.now();
     debugLog("spawn pipeline executable", {
       executable,
@@ -295,16 +387,7 @@ function spawnPipeline(
     const executableLibDir = path.join(executableDir, "lib");
     const platform = os.platform();
 
-    if (platform === "darwin") {
-      // macOS: include executable and bundled lib/ in dylib search path
-      const existingPath = spawnEnv.DYLD_LIBRARY_PATH || "";
-      const bundlePaths = fs.existsSync(executableLibDir)
-        ? `${executableDir}:${executableLibDir}`
-        : executableDir;
-      spawnEnv.DYLD_LIBRARY_PATH = existingPath
-        ? `${bundlePaths}:${existingPath}`
-        : bundlePaths;
-    } else if (platform === "linux") {
+    if (platform === "linux") {
       // Linux: include executable and bundled lib/ in shared library search path
       const existingPath = spawnEnv.LD_LIBRARY_PATH || "";
       const bundlePaths = fs.existsSync(executableLibDir)
@@ -347,18 +430,50 @@ function spawnPipeline(
     let stdout = "";
     let stderr = "";
     let stderrLineBuffer = "";
+    let hardTimeout: ReturnType<typeof setTimeout> | null = null;
+    let stallTimeout: ReturnType<typeof setTimeout> | null = null;
+    let timeoutReason: "hard" | "stall" | null = null;
+
+    const clearTimers = () => {
+      if (hardTimeout) clearTimeout(hardTimeout);
+      if (stallTimeout) clearTimeout(stallTimeout);
+      hardTimeout = null;
+      stallTimeout = null;
+    };
+    const armStallTimeout = () => {
+      if (stallTimeout) clearTimeout(stallTimeout);
+      stallTimeout = setTimeout(() => {
+        timeoutReason = "stall";
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // Ignore kill failure.
+        }
+      }, PIPELINE_STALL_TIMEOUT_MS);
+    };
+    hardTimeout = setTimeout(() => {
+      timeoutReason = "hard";
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Ignore kill failure.
+      }
+    }, PIPELINE_TIMEOUT_MS);
+    armStallTimeout();
 
     proc.stdout.on("data", (data) => {
       const chunk = data.toString();
-      stdout += chunk;
+      stdout = appendLimited(stdout, chunk, MAX_STDOUT_BYTES);
+      armStallTimeout();
       debugLog("stdout chunk", chunk);
     });
 
     proc.stderr.on("data", (data) => {
       const chunk = data.toString();
       debugLog("stderr chunk", chunk);
-      stderr += chunk;
+      stderr = appendLimited(stderr, chunk, MAX_STDERR_BYTES);
       stderrLineBuffer += chunk;
+      armStallTimeout();
 
       const lines = stderrLineBuffer.split(/\r?\n/);
       stderrLineBuffer = lines.pop() || "";
@@ -397,6 +512,7 @@ function spawnPipeline(
 
     proc.on("close", (code, signal) => {
       _activePipelineProcess = null;
+      clearTimers();
       debugLog("process closed", { code, signal });
 
       if (_activePipelineCancelled) {
@@ -412,15 +528,25 @@ function spawnPipeline(
       }
 
       if (code !== 0) {
+        const timeoutMessage =
+          timeoutReason === "hard"
+            ? `pipeline timed out after ${PIPELINE_TIMEOUT_MS}ms`
+            : timeoutReason === "stall"
+              ? `pipeline stalled for ${PIPELINE_STALL_TIMEOUT_MS}ms`
+              : null;
+        const hint = getExitHint(code);
         dispatchPipelineEvent("pipelineError", {
           stage: "runtime",
-          message: stderr || stdout || "Unknown pipeline runtime error.",
+          message:
+            timeoutMessage ||
+            `${hint}: ${stderr || stdout || "Unknown pipeline runtime error."}`,
           exitCode: code,
           signal: signal ?? null,
         });
         reject(
           new Error(
-            `Face pipeline exited with code ${String(code)} signal ${String(signal)}: ${stderr || stdout}`
+            timeoutMessage ||
+              `Face pipeline exited with code ${String(code)} signal ${String(signal)} (${hint}): ${stderr || stdout}`
           )
         );
         return;
@@ -465,6 +591,7 @@ function spawnPipeline(
 
     proc.on("error", (err) => {
       _activePipelineProcess = null;
+      clearTimers();
       debugLog("process error", err);
       dispatchPipelineEvent("pipelineError", {
         stage: "spawn",
@@ -613,9 +740,33 @@ export async function runFacePipeline(
   }
 
   // Clean paths (remove file:// prefix if present)
-  const cleanPaths = imagePaths.map((p) =>
-    p.startsWith("file://") ? p.replace("file://", "") : p
-  );
+  const cleanPaths = imagePaths
+    .map((rawPath) => {
+      if (!rawPath.startsWith("file://")) return rawPath;
+      try {
+        const parsed = new URL(rawPath);
+        const decoded = decodeURIComponent(parsed.pathname);
+        if (os.platform() === "win32") {
+          return decoded.replace(/^\/([A-Za-z]:\/)/, "$1");
+        }
+        return decoded;
+      } catch {
+        return rawPath.replace("file://", "");
+      }
+    })
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .sort((a, b) => {
+      const aBase = path.basename(a);
+      const bBase = path.basename(b);
+      const aMatch = aBase.match(/(\d+)(?!.*\d)/);
+      const bMatch = bBase.match(/(\d+)(?!.*\d)/);
+      if (aMatch && bMatch) {
+        const diff = Number(aMatch[1]) - Number(bMatch[1]);
+        if (diff !== 0) return diff;
+      }
+      return a.localeCompare(b);
+    });
 
   return spawnPipeline(cleanPaths, {
     confThresh: options.confThresh ?? 0.5,

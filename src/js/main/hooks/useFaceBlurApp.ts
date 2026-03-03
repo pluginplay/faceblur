@@ -1,9 +1,4 @@
-import {
-  useEffect,
-  useState,
-  useRef,
-  useCallback,
-} from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { subscribeBackgroundColor } from "../../lib/utils/bolt";
 import { buildAndImportMogrtFromTracks } from "../../lib/utils/mogrt";
 import { evalTS } from "../../lib/utils/bolt";
@@ -15,6 +10,7 @@ import {
   runFacePipeline,
   type FaceTrack,
 } from "../../lib/utils/faceDetection";
+import { toast } from "sonner";
 import type {
   UIMask,
   Dimensions,
@@ -26,8 +22,13 @@ import type {
 } from "../types";
 import { usePipelineEvents } from "./usePipelineEvents";
 import { useCanvas, isPointInPolygon } from "./useCanvas";
+import { isBetaLocked } from "../lib/betaGate";
 
 const POINT_HIT_THRESHOLD = 10;
+const ADJUSTMENT_LAYER_REMINDER =
+  "Right-click the newly added layer in Premiere and set it to Adjustment Layer.";
+const PLAYBACK_FPS = 30;
+const PREMIERE_TICKS_PER_SECOND = 254_016_000_000;
 
 function maskHasAnyValidShape(mask: UIMask): boolean {
   if (mask.keyframes) {
@@ -50,7 +51,8 @@ function faceTracksToMasks(tracks: FaceTrack[]): UIMask[] {
     track.frames.forEach((frame) => {
       keyframes[frame.frameIndex] = bboxToMaskPoints(frame.bbox);
     });
-    const first = track.frames.find((frame) => frame.frameIndex === 0) ?? track.frames[0];
+    const first =
+      track.frames.find((frame) => frame.frameIndex === 0) ?? track.frames[0];
     return {
       id: `track_${track.id}`,
       name: `Person ${idx + 1}`,
@@ -89,27 +91,28 @@ function uiMasksToMarkerMasks(masks: UIMask[]): MarkerMaskPayload[] {
 
 export function useFaceBlurApp() {
   const [bgColor, setBgColor] = useState("#282c34");
-  const [statusMessage, setStatusMessage] = useState("");
+  const [pipelineStatusMessage, setPipelineStatusMessage] = useState("");
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [masks, setMasks] = useState<UIMask[]>([]);
   const [activeMaskId, setActiveMaskId] = useState<string | null>(null);
   const [selectedPointIndex, setSelectedPointIndex] = useState<number | null>(
-    null
+    null,
   );
   const [isDrawing, setIsDrawing] = useState(false);
   const [menuOpenMaskId, setMenuOpenMaskId] = useState<string | null>(null);
   const [imageDimensions, setImageDimensions] = useState<Dimensions | null>(
-    null
+    null,
   );
-  const [displayDimensions, setDisplayDimensions] =
-    useState<Dimensions | null>(null);
+  const [displayDimensions, setDisplayDimensions] = useState<Dimensions | null>(
+    null,
+  );
   const [isDragging, setIsDragging] = useState(false);
   const [isDetectingFaces, setIsDetectingFaces] = useState(false);
   const [isRendering, setIsRendering] = useState(false);
   const [faceTracks, setFaceTracks] = useState<FaceTrack[] | null>(null);
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.5);
   const [loadedSegment, setLoadedSegment] = useState<LoadedSegmentState | null>(
-    null
+    null,
   );
   const [batchJob, setBatchJob] = useState<BatchJobState>({
     running: false,
@@ -120,22 +123,63 @@ export function useFaceBlurApp() {
   const [framePaths, setFramePaths] = useState<string[]>([]);
   const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [undoStack, setUndoStack] = useState<UIMask[][]>([]);
+  const [redoStack, setRedoStack] = useState<UIMask[][]>([]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const playbackIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const detectAbortRef = useRef<{ cancelled: boolean }>({ cancelled: false });
+  const dragStartMasksRef = useRef<UIMask[] | null>(null);
+  const dragChangedRef = useRef(false);
+
+  const playbackFps = useMemo(() => {
+    const ticksPerFrame = Number(loadedSegment?.segment.ticksPerFrame);
+    if (!Number.isFinite(ticksPerFrame) || ticksPerFrame <= 0) return PLAYBACK_FPS;
+    const fps = PREMIERE_TICKS_PER_SECOND / ticksPerFrame;
+    if (!Number.isFinite(fps) || fps <= 0) return PLAYBACK_FPS;
+    return Math.max(1, Math.min(240, fps));
+  }, [loadedSegment?.segment.ticksPerFrame]);
+
+  const playbackFrameMs = useMemo(() => 1000 / playbackFps, [playbackFps]);
 
   const { getCanvasCoordinates, drawCanvas, toNormalized } = useCanvas(
     canvasRef,
     imageDimensions,
     masks,
     activeMaskId,
-    selectedPointIndex
+    selectedPointIndex,
   );
 
-  usePipelineEvents(setStatusMessage);
+  const notifyInfo = useCallback((message: string) => {
+    toast(message, { duration: 2500 });
+  }, []);
+
+  const notifySuccess = useCallback((message: string) => {
+    toast.success(message, { duration: 3500 });
+  }, []);
+
+  const notifyWarning = useCallback((message: string) => {
+    toast.warning(message, { duration: 4000 });
+  }, []);
+
+  const notifyError = useCallback((message: string) => {
+    toast.error(message, { duration: 6000 });
+  }, []);
+
+  const notifyMogrtResult = useCallback(
+    (result: string, successMessage: string) => {
+      if (result.toLowerCase().startsWith("error")) {
+        notifyError(result);
+        return;
+      }
+      notifySuccess(`${successMessage} ${ADJUSTMENT_LAYER_REMINDER}`);
+    },
+    [notifyError, notifySuccess],
+  );
+
+  usePipelineEvents(setPipelineStatusMessage);
 
   useEffect(() => {
     if (window.cep) subscribeBackgroundColor(setBgColor);
@@ -154,18 +198,24 @@ export function useFaceBlurApp() {
 
   useEffect(() => {
     drawCanvas();
-  }, [masks, activeMaskId, selectedPointIndex, previewImage, imageDimensions, drawCanvas]);
+  }, [
+    masks,
+    activeMaskId,
+    selectedPointIndex,
+    imageDimensions,
+    drawCanvas,
+  ]);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || !previewImage || !imageDimensions) return;
+    if (!container || !imageDimensions) return;
     const update = () => {
       const img = imageRef.current;
       if (!img) return;
       const rect = container.getBoundingClientRect();
       const scale = Math.min(
         rect.width / imageDimensions.width,
-        rect.height / imageDimensions.height
+        rect.height / imageDimensions.height,
       );
       setDisplayDimensions({
         width: imageDimensions.width * scale,
@@ -176,7 +226,7 @@ export function useFaceBlurApp() {
     const ro = new ResizeObserver(update);
     ro.observe(container);
     return () => ro.disconnect();
-  }, [previewImage, imageDimensions]);
+  }, [imageDimensions]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -184,16 +234,24 @@ export function useFaceBlurApp() {
     canvas.width = imageDimensions.width;
     canvas.height = imageDimensions.height;
     drawCanvas();
-  }, [displayDimensions, imageDimensions, drawCanvas]);
+  }, [imageDimensions, drawCanvas]);
 
   useEffect(() => {
-    if (framePaths.length === 0) return;
-    const clamped = Math.max(0, Math.min(currentFrameIndex, framePaths.length - 1));
+    if (framePaths.length === 0) {
+      setPreviewImage(null);
+      return;
+    }
+    const clamped = Math.max(
+      0,
+      Math.min(currentFrameIndex, framePaths.length - 1),
+    );
     const nextPath = framePaths[clamped];
     try {
-      if (fs.existsSync?.(nextPath)) {
+      if (import.meta.env.DEV && fs.existsSync?.(nextPath)) {
         const buf = fs.readFileSync(nextPath);
-        const base64 = Buffer.from(buf as unknown as Uint8Array).toString("base64");
+        const base64 = Buffer.from(buf as unknown as Uint8Array).toString(
+          "base64",
+        );
         setPreviewImage(`data:image/png;base64,${base64}`);
       } else {
         setPreviewImage(nextPath);
@@ -205,8 +263,12 @@ export function useFaceBlurApp() {
 
   useEffect(() => {
     if (isDragging) return;
-    setMasks((prev) =>
-      prev.map((m) => {
+    setMasks((prev) => {
+      if (!prev.some((m) => m.keyframes && Object.keys(m.keyframes).length > 0)) {
+        return prev;
+      }
+      let hasChanged = false;
+      const next = prev.map((m) => {
         if (!m.keyframes) return m;
         const pts = getMaskPointsAtFrame(m, currentFrameIndex);
         if (
@@ -214,13 +276,15 @@ export function useFaceBlurApp() {
           m.points.every(
             (p, i) =>
               Math.abs(p.x - pts[i].x) < 1e-6 &&
-              Math.abs(p.y - pts[i].y) < 1e-6
+              Math.abs(p.y - pts[i].y) < 1e-6,
           )
         )
           return m;
+        hasChanged = true;
         return { ...m, points: pts };
-      })
-    );
+      });
+      return hasChanged ? next : prev;
+    });
   }, [currentFrameIndex, isDragging]);
 
   useEffect(() => {
@@ -234,7 +298,7 @@ export function useFaceBlurApp() {
           }
           return next;
         });
-      }, 1000 / 30);
+      }, playbackFrameMs);
     } else if (playbackIntervalRef.current) {
       clearInterval(playbackIntervalRef.current);
       playbackIntervalRef.current = null;
@@ -245,7 +309,7 @@ export function useFaceBlurApp() {
         playbackIntervalRef.current = null;
       }
     };
-  }, [isPlaying, framePaths.length]);
+  }, [isPlaying, framePaths.length, playbackFrameMs]);
 
   const readPngSequence = useCallback((dir: string): string[] => {
     try {
@@ -264,15 +328,82 @@ export function useFaceBlurApp() {
     }
   }, []);
 
+  const resetMaskHistory = useCallback(() => {
+    setUndoStack([]);
+    setRedoStack([]);
+    dragStartMasksRef.current = null;
+    dragChangedRef.current = false;
+  }, []);
+
+  const commitMaskChange = useCallback(
+    (updater: (prev: UIMask[]) => UIMask[]) => {
+      setMasks((prev) => {
+        const next = updater(prev);
+        if (next === prev) return prev;
+
+        setUndoStack((stack) => [...stack, prev]);
+        setRedoStack([]);
+
+        if (activeMaskId && !next.some((mask) => mask.id === activeMaskId)) {
+          setActiveMaskId(next[0]?.id ?? null);
+          setSelectedPointIndex(null);
+        }
+        return next;
+      });
+    },
+    [activeMaskId],
+  );
+
+  const undoMasks = useCallback(() => {
+    setUndoStack((stack) => {
+      if (stack.length === 0) return stack;
+      const previous = stack[stack.length - 1];
+      setMasks((current) => {
+        setRedoStack((redo) => [current, ...redo]);
+        setActiveMaskId((currentId) =>
+          previous.some((mask) => mask.id === currentId)
+            ? currentId
+            : (previous[0]?.id ?? null),
+        );
+        setSelectedPointIndex(null);
+        return previous;
+      });
+      return stack.slice(0, -1);
+    });
+  }, []);
+
+  const redoMasks = useCallback(() => {
+    setRedoStack((stack) => {
+      if (stack.length === 0) return stack;
+      const [next, ...rest] = stack;
+      setMasks((current) => {
+        setUndoStack((undo) => [...undo, current]);
+        setActiveMaskId((currentId) =>
+          next.some((mask) => mask.id === currentId)
+            ? currentId
+            : (next[0]?.id ?? null),
+        );
+        setSelectedPointIndex(null);
+        return next;
+      });
+      return rest;
+    });
+  }, []);
+
   const loadPayloadIntoPanel = useCallback(
     (
       markerGuid: string,
       payload: MarkerPayload,
-      sequencePathsOverride?: string[]
+      sequencePathsOverride?: string[],
     ) => {
-      const nextFramePaths = sequencePathsOverride ?? readPngSequence(payload.pngDir);
+      const nextFramePaths =
+        sequencePathsOverride ?? readPngSequence(payload.pngDir);
+      setPreviewImage(null);
+      setImageDimensions(null);
+      setDisplayDimensions(null);
       setFramePaths(nextFramePaths);
       setCurrentFrameIndex(0);
+      resetMaskHistory();
       const nextMasks = markerMasksToUiMasks(payload.masks);
       setMasks(nextMasks);
       setActiveMaskId(nextMasks[0]?.id ?? null);
@@ -284,10 +415,11 @@ export function useFaceBlurApp() {
         pngDir: payload.pngDir,
       });
     },
-    [readPngSequence]
+    [readPngSequence, resetMaskHistory],
   );
 
   const resetLoadedPanelState = useCallback(() => {
+    resetMaskHistory();
     setLoadedSegment(null);
     setFaceTracks(null);
     setMasks([]);
@@ -296,8 +428,10 @@ export function useFaceBlurApp() {
     setFramePaths([]);
     setCurrentFrameIndex(0);
     setPreviewImage(null);
+    setImageDimensions(null);
+    setDisplayDimensions(null);
     setIsPlaying(false);
-  }, []);
+  }, [resetMaskHistory]);
 
   const persistCurrentMasksToLoadedMarker = useCallback(
     async (overrideMasks?: UIMask[]) => {
@@ -320,11 +454,11 @@ export function useFaceBlurApp() {
                 ...prev,
                 markerGuid: upsertResult.markerGuid,
               }
-            : prev
+            : prev,
         );
       }
     },
-    [loadedSegment, masks]
+    [loadedSegment, masks],
   );
 
   const handleImageLoad = useCallback(() => {
@@ -333,16 +467,29 @@ export function useFaceBlurApp() {
     if (!img || !container) return;
     const w = img.naturalWidth;
     const h = img.naturalHeight;
-    setImageDimensions({ width: w, height: h });
+    setImageDimensions((prev) =>
+      prev && prev.width === w && prev.height === h ? prev : { width: w, height: h },
+    );
     const rect = container.getBoundingClientRect();
     const scale = Math.min(rect.width / w, rect.height / h);
-    setDisplayDimensions({ width: w * scale, height: h * scale });
+    setDisplayDimensions((prev) => {
+      const next = { width: w * scale, height: h * scale };
+      if (
+        prev &&
+        Math.abs(prev.width - next.width) < 0.001 &&
+        Math.abs(prev.height - next.height) < 0.001
+      ) {
+        return prev;
+      }
+      return next;
+    });
     const canvas = canvasRef.current;
     if (canvas) {
-      canvas.width = w;
-      canvas.height = h;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
     }
-  }, []);
+    drawCanvas();
+  }, [drawCanvas]);
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -356,12 +503,12 @@ export function useFaceBlurApp() {
 
       if (isDrawing) {
         if (!activeMaskId) return;
-        setMasks((prev) =>
+        commitMaskChange((prev) =>
           prev.map((m) =>
             m.id === activeMaskId
               ? { ...m, points: [...m.points, normalized] }
-              : m
-          )
+              : m,
+          ),
         );
         return;
       }
@@ -383,7 +530,10 @@ export function useFaceBlurApp() {
 
       for (let i = masks.length - 1; i >= 0; i--) {
         const mask = masks[i];
-        if (mask.points.length >= 3 && isPointInPolygon(normalized, mask.points)) {
+        if (
+          mask.points.length >= 3 &&
+          isPointInPolygon(normalized, mask.points)
+        ) {
           setActiveMaskId(mask.id);
           setSelectedPointIndex(null);
           return;
@@ -397,8 +547,9 @@ export function useFaceBlurApp() {
       isDrawing,
       activeMaskId,
       masks,
+      commitMaskChange,
       getCanvasCoordinates,
-    ]
+    ],
   );
 
   const handleCanvasMouseDown = useCallback(
@@ -414,12 +565,14 @@ export function useFaceBlurApp() {
         if (Math.hypot(coords.x - px, coords.y - py) <= POINT_HIT_THRESHOLD) {
           setSelectedPointIndex(i);
           setIsDragging(true);
+          dragStartMasksRef.current = masks;
+          dragChangedRef.current = false;
           e.preventDefault();
           break;
         }
       }
     },
-    [imageDimensions, isDrawing, activeMaskId, masks, getCanvasCoordinates]
+    [imageDimensions, isDrawing, activeMaskId, masks, getCanvasCoordinates],
   );
 
   const handleCanvasMouseMove = useCallback(
@@ -434,6 +587,7 @@ export function useFaceBlurApp() {
       const coords = getCanvasCoordinates(e);
       if (!coords) return;
       const normalized = toNormalized(coords.x, coords.y);
+      dragChangedRef.current = true;
       setMasks((prev) =>
         prev.map((m) => {
           if (m.id !== activeMaskId) return m;
@@ -447,7 +601,7 @@ export function useFaceBlurApp() {
             };
           }
           return updated;
-        })
+        }),
       );
     },
     [
@@ -459,25 +613,42 @@ export function useFaceBlurApp() {
       currentFrameIndex,
       getCanvasCoordinates,
       toNormalized,
-    ]
+    ],
   );
 
-  const handleCanvasMouseUp = useCallback(() => setIsDragging(false), []);
+  const handleCanvasMouseUp = useCallback(() => {
+    if (!isDragging) return;
+    setIsDragging(false);
+    if (dragStartMasksRef.current && dragChangedRef.current) {
+      setUndoStack((stack) => [
+        ...stack,
+        dragStartMasksRef.current as UIMask[],
+      ]);
+      setRedoStack([]);
+    }
+    dragStartMasksRef.current = null;
+    dragChangedRef.current = false;
+  }, [isDragging]);
 
   const handleLoadAndRenderSequence = useCallback(async () => {
+    if (isBetaLocked()) {
+      notifyWarning("Face Blur beta has ended. This panel is locked.");
+      return;
+    }
+
     try {
       detectAbortRef.current.cancelled = false;
+      setPipelineStatusMessage("Reading selected clips…");
       setBatchJob({ running: true, totalSegments: 0, completedSegments: 0 });
       setIsRendering(true);
-      setStatusMessage("Reading selected clips…");
 
       const rawSegments = await evalTS("getSelectedClipSegments");
       if (typeof rawSegments === "string") {
-        setStatusMessage(rawSegments);
+        setPipelineStatusMessage(rawSegments);
         return;
       }
       if (!Array.isArray(rawSegments) || rawSegments.length === 0) {
-        setStatusMessage("No selected clips found.");
+        setPipelineStatusMessage("No selected clips found.");
         return;
       }
       const segments = rawSegments as SegmentDescriptor[];
@@ -496,17 +667,19 @@ export function useFaceBlurApp() {
         const safeSegmentId = segment.segmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
         const folder = path.join(
           os.tmpdir(),
-          `face_blur_seg_${safeSegmentId}_${Date.now().toString(36)}`
+          `face_blur_seg_${safeSegmentId}_${Date.now().toString(36)}`,
         );
         if (!fs.existsSync(folder)) fs.mkdirSync(folder);
 
         setIsRendering(true);
         setIsDetectingFaces(false);
-        setStatusMessage(`Rendering segment ${label} (${segment.numFrames} frames)…`);
+        setPipelineStatusMessage(
+          `Rendering segment ${label} (${segment.numFrames} frames)…`,
+        );
         const renderResult = await evalTS(
           "exportSegmentAsImageSequence",
           segment,
-          folder
+          folder,
         );
         if (typeof renderResult === "string") {
           throw new Error(`Segment ${label} render failed: ${renderResult}`);
@@ -519,7 +692,7 @@ export function useFaceBlurApp() {
 
         setIsRendering(false);
         setIsDetectingFaces(true);
-        setStatusMessage(`Detecting faces in segment ${label}…`);
+        setPipelineStatusMessage(`Detecting faces in segment ${label}…`);
         const pipelineResult = await runFacePipeline(pngs, {
           confThresh: confidenceThreshold,
           videoFps: 30.0,
@@ -543,7 +716,9 @@ export function useFaceBlurApp() {
         };
         const markerResult = await evalTS("upsertSegmentMarker", markerPayload);
         if (typeof markerResult === "string") {
-          throw new Error(`Segment ${label} marker write failed: ${markerResult}`);
+          throw new Error(
+            `Segment ${label} marker write failed: ${markerResult}`,
+          );
         }
 
         if (i === segments.length - 1) {
@@ -557,27 +732,28 @@ export function useFaceBlurApp() {
           completedSegments: i + 1,
         });
       }
-      setStatusMessage(`Batch complete. Processed ${segments.length} segment(s).`);
+      notifySuccess(`Batch complete. Processed ${segments.length} segment(s).`);
     } catch (e: unknown) {
-      setStatusMessage(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      notifyError(`Error: ${e instanceof Error ? e.message : String(e)}`);
       setFaceTracks(null);
     } finally {
+      setPipelineStatusMessage("");
       setBatchJob((prev) => ({ ...prev, running: false }));
       setIsRendering(false);
       setIsDetectingFaces(false);
     }
-  }, [confidenceThreshold, loadPayloadIntoPanel, readPngSequence]);
+  }, [confidenceThreshold, loadPayloadIntoPanel, notifyError, notifySuccess, readPngSequence]);
 
   const handleApplyMasks = useCallback(async () => {
     if (!loadedSegment) {
-      setStatusMessage("Load a segment marker first.");
+      notifyWarning("Load a segment marker first.");
       return;
     }
     const segment = loadedSegment.segment;
 
     if (masks.length > 0 && masks.some((m) => m.keyframes)) {
       try {
-        setStatusMessage("Building and importing MOGRT from edited masks…");
+        notifyInfo("Building and importing MOGRT from edited masks…");
         const trackSpecs = masks
           .filter((m) => m.keyframes && Object.keys(m.keyframes).length > 0)
           .map((m) => {
@@ -596,7 +772,7 @@ export function useFaceBlurApp() {
           });
 
         if (trackSpecs.length === 0) {
-          setStatusMessage("No masks with keyframes found.");
+          notifyWarning("No masks with keyframes found.");
           return;
         }
 
@@ -610,17 +786,19 @@ export function useFaceBlurApp() {
             framePaths.length > 0 ? framePaths.length : segment.numFrames,
         });
         await persistCurrentMasksToLoadedMarker();
-        setStatusMessage(res);
+        notifyMogrtResult(res, "Applied edited masks to timeline.");
         return;
       } catch (e: unknown) {
-        setStatusMessage(`Error building from edited masks: ${e instanceof Error ? e.message : String(e)}`);
+        notifyError(
+          `Error building from edited masks: ${e instanceof Error ? e.message : String(e)}`,
+        );
         return;
       }
     }
 
     if (faceTracks) {
       try {
-        setStatusMessage("Building and importing MOGRT from tracked faces…");
+        notifyInfo("Building and importing MOGRT from tracked faces…");
         const trackSpecs = faceTracks.map((t) => ({
           frames: t.frames.map((f) => ({
             frameIndex: f.frameIndex,
@@ -640,23 +818,25 @@ export function useFaceBlurApp() {
             framePaths.length > 0 ? framePaths.length : segment.numFrames,
         });
         await persistCurrentMasksToLoadedMarker();
-        setStatusMessage(res);
+        notifyMogrtResult(res, "Applied tracked face masks to timeline.");
         return;
       } catch (e: unknown) {
-        setStatusMessage(`Error building from tracks: ${e instanceof Error ? e.message : String(e)}`);
+        notifyError(
+          `Error building from tracks: ${e instanceof Error ? e.message : String(e)}`,
+        );
       }
     }
 
     if (masks.length === 0) {
-      setStatusMessage("Please create at least one mask before applying.");
+      notifyWarning("Please create at least one mask before applying.");
       return;
     }
     if (masks.some((m) => m.points.length < 3)) {
-      setStatusMessage("Each mask must have at least 3 points.");
+      notifyWarning("Each mask must have at least 3 points.");
       return;
     }
     try {
-      setStatusMessage("Building and importing MOGRT with multiple masks...");
+      notifyInfo("Building and importing MOGRT with multiple masks...");
       const staticTrackSpecs = masks.map((m) => ({
         frames: [{ frameIndex: 0, points: m.points }],
         blurriness: m.blurriness ?? 50,
@@ -669,24 +849,32 @@ export function useFaceBlurApp() {
         endTicks: segment.endTicks,
         videoTrackOffset: 1,
         audioTrackOffset: 0,
-        numFrames: framePaths.length > 0 ? framePaths.length : segment.numFrames,
+        numFrames:
+          framePaths.length > 0 ? framePaths.length : segment.numFrames,
       });
       await persistCurrentMasksToLoadedMarker();
-      setStatusMessage(result);
+      notifyMogrtResult(result, "Applied masks to timeline.");
     } catch (error: unknown) {
-      setStatusMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+      notifyError(`Error: ${error instanceof Error ? error.message : String(error)}`);
     }
   }, [
     masks,
     faceTracks,
     loadedSegment,
     framePaths.length,
+    notifyError,
+    notifyInfo,
+    notifyMogrtResult,
+    notifyWarning,
     persistCurrentMasksToLoadedMarker,
   ]);
 
   const handlePanelMouseEnter = useCallback(async () => {
     const selectedSegments = await evalTS("getSelectedClipSegments");
-    if (typeof selectedSegments === "string" || !Array.isArray(selectedSegments)) {
+    if (
+      typeof selectedSegments === "string" ||
+      !Array.isArray(selectedSegments)
+    ) {
       setSelectedClipCount(0);
     } else {
       setSelectedClipCount(selectedSegments.length);
@@ -699,7 +887,6 @@ export function useFaceBlurApp() {
     }
     if (!markerAtCti?.found) {
       resetLoadedPanelState();
-      setStatusMessage("No segment marker at CTI.");
       return;
     }
 
@@ -715,9 +902,6 @@ export function useFaceBlurApp() {
     }
 
     loadPayloadIntoPanel(markerAtCti.markerGuid, payload);
-    setStatusMessage(
-      `Loaded segment ${payload.segment.segmentId} from sequence marker.`
-    );
   }, [
     batchJob.running,
     isRendering,
@@ -737,145 +921,165 @@ export function useFaceBlurApp() {
       feather: 10,
       expansion: 0,
     };
-    setMasks((prev) => [...prev, newMask]);
+    commitMaskChange((prev) => [...prev, newMask]);
     setActiveMaskId(id);
     setSelectedPointIndex(null);
-  }, [masks.length]);
+  }, [masks.length, commitMaskChange]);
 
-  const removeMask = useCallback((maskId: string) => {
-    setMasks((prev) => {
-      const filtered = prev.filter((m) => m.id !== maskId);
-      if (activeMaskId === maskId) {
-        setActiveMaskId(filtered.length ? filtered[filtered.length - 1].id : null);
-      }
-      return filtered;
-    });
-    setSelectedPointIndex(null);
-  }, [activeMaskId]);
-
-  const splitMask = useCallback((maskId: string, splitFrame: number) => {
-    setMasks((prev) => {
-      const mask = prev.find((m) => m.id === maskId);
-      if (!mask || !mask.keyframes) {
-        setStatusMessage("Cannot split mask: no keyframes found.");
-        return prev;
-      }
-
-      const keyframesToMove: Record<number, MaskPoint[]> = {};
-      const keyframesToKeep: Record<number, MaskPoint[]> = {};
-
-      Object.keys(mask.keyframes).forEach((frameStr) => {
-        const fi = Number(frameStr);
-        if (fi >= splitFrame) keyframesToMove[fi] = mask.keyframes![fi];
-        else keyframesToKeep[fi] = mask.keyframes![fi];
-      });
-
-      if (Object.keys(keyframesToMove).length === 0) {
-        setStatusMessage("No keyframes to split at this frame.");
-        return prev;
-      }
-
-      const newMaskId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const firstSplitFrame = Math.min(...Object.keys(keyframesToMove).map(Number));
-      const newMask: UIMask = {
-        id: newMaskId,
-        name: `${mask.name} (split)`,
-        points: keyframesToMove[firstSplitFrame] || mask.points,
-        blurriness: mask.blurriness ?? 50,
-        feather: mask.feather ?? 10,
-        expansion: mask.expansion ?? 0,
-        keyframes: keyframesToMove,
-      };
-
-      const updatedMasks = prev.map((m) => {
-        if (m.id !== maskId) return m;
-        const lastKeptFrame = Math.max(
-          ...Object.keys(keyframesToKeep).map(Number),
-          -1
-        );
-        return {
-          ...m,
-          keyframes: keyframesToKeep,
-          points:
-            lastKeptFrame >= 0 ? keyframesToKeep[lastKeptFrame] : m.points,
-        };
-      });
-
-      setActiveMaskId(newMaskId);
-      setSelectedPointIndex(null);
-      setStatusMessage(`Split mask at frame ${splitFrame + 1}.`);
-      return [...updatedMasks, newMask];
-    });
-  }, []);
-
-  const mergeMask = useCallback((sourceMaskId: string, targetMaskId: string) => {
-    setMasks((prev) => {
-      const source = prev.find((m) => m.id === sourceMaskId);
-      const target = prev.find((m) => m.id === targetMaskId);
-      if (!source || !target) {
-        setStatusMessage("Cannot merge: mask not found.");
-        return prev;
-      }
-
-      const mergedKeyframes: Record<number, MaskPoint[]> = {
-        ...target.keyframes,
-      };
-      if (source.keyframes) {
-        Object.keys(source.keyframes).forEach((frameStr) => {
-          const fi = Number(frameStr);
-          if (fi >= currentFrameIndex && !mergedKeyframes[fi]) {
-            mergedKeyframes[fi] = source.keyframes![fi];
-          }
-        });
-      }
-
-      const updated = prev
-        .map((m) => {
-          if (m.id !== targetMaskId) return m;
-          const pts = getMaskPointsAtFrame(
-            { ...m, keyframes: mergedKeyframes },
-            currentFrameIndex
+  const removeMask = useCallback(
+    (maskId: string) => {
+      commitMaskChange((prev) => {
+        const filtered = prev.filter((m) => m.id !== maskId);
+        if (filtered.length === prev.length) return prev;
+        if (activeMaskId === maskId) {
+          setActiveMaskId(
+            filtered.length ? filtered[filtered.length - 1].id : null,
           );
-          return { ...m, keyframes: mergedKeyframes, points: pts };
-        })
-        .filter((m) => m.id !== sourceMaskId);
-
-      if (activeMaskId === sourceMaskId) setActiveMaskId(targetMaskId);
+        }
+        return filtered;
+      });
       setSelectedPointIndex(null);
-      setStatusMessage(
-        `Merged ${source.name} into ${target.name} from frame ${currentFrameIndex + 1} forward.`
-      );
-      return updated;
-    });
-  }, [currentFrameIndex, activeMaskId]);
+    },
+    [activeMaskId, commitMaskChange],
+  );
+
+  const splitMask = useCallback(
+    (maskId: string, splitFrame: number) => {
+      commitMaskChange((prev) => {
+        const mask = prev.find((m) => m.id === maskId);
+        if (!mask || !mask.keyframes) {
+          notifyWarning("Cannot split mask: no keyframes found.");
+          return prev;
+        }
+
+        const keyframesToMove: Record<number, MaskPoint[]> = {};
+        const keyframesToKeep: Record<number, MaskPoint[]> = {};
+
+        Object.keys(mask.keyframes).forEach((frameStr) => {
+          const fi = Number(frameStr);
+          if (fi >= splitFrame) keyframesToMove[fi] = mask.keyframes![fi];
+          else keyframesToKeep[fi] = mask.keyframes![fi];
+        });
+
+        if (Object.keys(keyframesToMove).length === 0) {
+          notifyWarning("No keyframes to split at this frame.");
+          return prev;
+        }
+
+        const newMaskId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const firstSplitFrame = Math.min(
+          ...Object.keys(keyframesToMove).map(Number),
+        );
+        const newMask: UIMask = {
+          id: newMaskId,
+          name: `${mask.name} (split)`,
+          points: keyframesToMove[firstSplitFrame] || mask.points,
+          blurriness: mask.blurriness ?? 50,
+          feather: mask.feather ?? 10,
+          expansion: mask.expansion ?? 0,
+          keyframes: keyframesToMove,
+        };
+
+        const updatedMasks = prev.map((m) => {
+          if (m.id !== maskId) return m;
+          const lastKeptFrame = Math.max(
+            ...Object.keys(keyframesToKeep).map(Number),
+            -1,
+          );
+          return {
+            ...m,
+            keyframes: keyframesToKeep,
+            points:
+              lastKeptFrame >= 0 ? keyframesToKeep[lastKeptFrame] : m.points,
+          };
+        });
+
+        setActiveMaskId(newMaskId);
+        setSelectedPointIndex(null);
+        notifySuccess(`Split mask at frame ${splitFrame + 1}.`);
+        return [...updatedMasks, newMask];
+      });
+    },
+    [commitMaskChange, notifySuccess, notifyWarning],
+  );
+
+  const mergeMask = useCallback(
+    (sourceMaskId: string, targetMaskId: string) => {
+      commitMaskChange((prev) => {
+        const source = prev.find((m) => m.id === sourceMaskId);
+        const target = prev.find((m) => m.id === targetMaskId);
+        if (!source || !target) {
+          notifyWarning("Cannot merge: mask not found.");
+          return prev;
+        }
+
+        const mergedKeyframes: Record<number, MaskPoint[]> = {
+          ...target.keyframes,
+        };
+        if (source.keyframes) {
+          Object.keys(source.keyframes).forEach((frameStr) => {
+            const fi = Number(frameStr);
+            if (fi >= currentFrameIndex && !mergedKeyframes[fi]) {
+              mergedKeyframes[fi] = source.keyframes![fi];
+            }
+          });
+        }
+
+        const updated = prev
+          .map((m) => {
+            if (m.id !== targetMaskId) return m;
+            const pts = getMaskPointsAtFrame(
+              { ...m, keyframes: mergedKeyframes },
+              currentFrameIndex,
+            );
+            return { ...m, keyframes: mergedKeyframes, points: pts };
+          })
+          .filter((m) => m.id !== sourceMaskId);
+
+        if (activeMaskId === sourceMaskId) setActiveMaskId(targetMaskId);
+        setSelectedPointIndex(null);
+        notifySuccess(
+          `Merged ${source.name} into ${target.name} from frame ${currentFrameIndex + 1} forward.`,
+        );
+        return updated;
+      });
+    },
+    [currentFrameIndex, activeMaskId, commitMaskChange, notifySuccess, notifyWarning],
+  );
 
   const updateActiveMaskValue = useCallback(
     (field: "blurriness" | "feather" | "expansion", value: number) => {
       if (!activeMaskId) return;
-      setMasks((prev) =>
-        prev.map((m) => (m.id === activeMaskId ? { ...m, [field]: value } : m))
+      commitMaskChange((prev) =>
+        prev.map((m) => {
+          if (m.id !== activeMaskId) return m;
+          if (m[field] === value) return m;
+          return { ...m, [field]: value };
+        }),
       );
     },
-    [activeMaskId]
+    [activeMaskId, commitMaskChange],
   );
 
   const handleCancel = useCallback(() => {
     detectAbortRef.current.cancelled = true;
     const cancelled = cancelFacePipeline();
-    if (cancelled) setStatusMessage("Cancelling face detection...");
+    if (cancelled) setPipelineStatusMessage("Cancelling face detection...");
     else if (isRendering)
-      setStatusMessage(
-        "Cancel requested. Waiting for Premiere render export to finish..."
+      setPipelineStatusMessage(
+        "Cancel requested. Waiting for Premiere render export to finish...",
       );
-    else setStatusMessage("Cancel requested.");
+    else setPipelineStatusMessage("Cancel requested.");
   }, [isRendering]);
 
   const jobRunning = batchJob.running || isRendering || isDetectingFaces;
+  const canUndo = undoStack.length > 0;
+  const canRedo = redoStack.length > 0;
 
   return {
     // State
     bgColor,
-    statusMessage,
+    pipelineStatusMessage,
     previewImage,
     masks,
     activeMaskId,
@@ -897,8 +1101,11 @@ export function useFaceBlurApp() {
     framePaths,
     currentFrameIndex,
     setCurrentFrameIndex,
+    playbackFps,
     isPlaying,
     setIsPlaying,
+    canUndo,
+    canRedo,
 
     // Refs
     canvasRef,
@@ -915,6 +1122,8 @@ export function useFaceBlurApp() {
     handlePanelMouseEnter,
     handleApplyMasks,
     handleCancel,
+    undoMasks,
+    redoMasks,
 
     // Mask actions
     addMask,

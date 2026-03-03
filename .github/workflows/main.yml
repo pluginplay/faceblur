@@ -39,8 +39,32 @@ jobs:
           rm -rf native_out/macos
           mkdir -p native_out/macos
           cmake --install cpp/build --prefix native_out/macos
+          if [[ ! -f native_out/macos/models/scrfd_2.5g_kps_640x640.onnx || ! -f native_out/macos/models/rf_detr_small/rf-detr-small.onnx ]]; then
+            bash scripts/setup_onnx_models.sh native_out/macos/models
+          fi
           chmod +x scripts/stage-native-macos.sh
           scripts/stage-native-macos.sh native_out/macos/face_pipeline native_out/macos
+
+      - name: Verify native payload (macOS)
+        run: node scripts/verify-native-bundle.mjs --target macos --bin-dir native_out/macos --skip-models
+
+      - name: Sign native payload (macOS)
+        env:
+          MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          MAC_CODESIGN_ENTITLEMENTS: scripts/macos-native.entitlements
+        run: |
+          chmod +x scripts/sign-macos-native.sh
+          scripts/sign-macos-native.sh native_out/macos
+
+      - name: Notarize native payload (macOS)
+        env:
+          MAC_NOTARY_KEYCHAIN_PROFILE: ${{ secrets.MAC_NOTARY_KEYCHAIN_PROFILE }}
+          MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+          MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
+          MAC_NOTARY_APP_PASSWORD: ${{ secrets.MAC_NOTARY_APP_PASSWORD }}
+        run: |
+          chmod +x scripts/notarize-macos-native.sh
+          scripts/notarize-macos-native.sh native_out/macos
 
       - uses: actions/upload-artifact@v4
         with:
@@ -54,6 +78,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
       - name: Install native deps (Windows)
         run: |
@@ -78,6 +106,20 @@ jobs:
           mkdir native_out\\windows
           cmake --install cpp/build --prefix native_out\\windows --config Release
         shell: cmd
+
+      - name: Stage runtime DLL closure (Windows)
+        run: node scripts/stage-native-windows.mjs native_out/windows/face_pipeline.exe native_out/windows
+
+      - name: Verify native payload (Windows)
+        run: node scripts/verify-native-bundle.mjs --target windows --bin-dir native_out/windows --skip-models
+
+      - name: Sign native payload (Windows)
+        shell: powershell
+        env:
+          WIN_SIGN_PFX_BASE64: ${{ secrets.WIN_SIGN_PFX_BASE64 }}
+          WIN_SIGN_PFX_PASSWORD: ${{ secrets.WIN_SIGN_PFX_PASSWORD }}
+          WIN_TIMESTAMP_URL: ${{ secrets.WIN_TIMESTAMP_URL }}
+        run: ./scripts/sign-windows-native.ps1 -TargetDir native_out/windows
 
       - uses: actions/upload-artifact@v4
         with:
@@ -110,24 +152,44 @@ jobs:
         run: |
           mkdir -p src/bin
           cp -Rf _native/native-macos/. src/bin/
-          # windows binary
           cp -Rf _native/native-windows/. src/bin/
+          chmod +x src/bin/face_pipeline.app/Contents/MacOS/face_pipeline || true
 
-          chmod +x src/bin/face_pipeline || true
+      - name: Ensure model payload exists
+        run: |
+          if [[ ! -f src/bin/models/scrfd_2.5g_kps_640x640.onnx || ! -f src/bin/models/rf_detr_small/rf-detr-small.onnx ]]; then
+            bash scripts/setup_onnx_models.sh src/bin/models
+          fi
+          mkdir -p src/bin/face_pipeline.app/Contents/Resources/models
+          cp -Rf src/bin/models/. src/bin/face_pipeline.app/Contents/Resources/models/
+
+      - name: Verify assembled cross-platform native bundle
+        run: yarn verify:native:all
 
       - name: Build ZXP
         run: yarn zxp
 
       - name: Verify packaged native artifacts
         run: |
-          test -f dist/cep/bin/face_pipeline
+          test -d dist/cep/bin/face_pipeline.app
+          test -f dist/cep/bin/face_pipeline.app/Contents/MacOS/face_pipeline
+          ls dist/cep/bin/face_pipeline.app/Contents/Frameworks/*.dylib >/dev/null
+          test -f dist/cep/bin/face_pipeline.app/Contents/Resources/models/scrfd_2.5g_kps_640x640.onnx
+          test -f dist/cep/bin/face_pipeline.app/Contents/Resources/models/rf_detr_small/rf-detr-small.onnx
           test -f dist/cep/bin/face_pipeline.exe
           test -f dist/cep/bin/models/scrfd_2.5g_kps_640x640.onnx
           test -f dist/cep/bin/models/rf_detr_small/rf-detr-small.onnx
-          ls dist/cep/bin/lib/*.dylib >/dev/null
+          test -f dist/cep/bin/windows-runtime-manifest.json
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          shasum -a 256 zxp/* > SHA256SUMS.txt
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: "./dist/zxp/*"
+          files: |
+            ./dist/zxp/*
+            ./dist/SHA256SUMS.txt

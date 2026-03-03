@@ -1,1 +1,2 @@
 src/bin/models/rf_detr_small/rf-detr-small.onnx filter=lfs diff=lfs merge=lfs -text
+src/bin/face_pipeline.app/Contents/Resources/models/rf_detr_small/rf-detr-small.onnx filter=lfs diff=lfs merge=lfs -text
