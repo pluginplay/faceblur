@@ -1,5 +1,5 @@
 import { fs, os, path } from "../../cep/node";
-import { evalTS } from "../bolt";
+import { evalTSResult } from "../bridge";
 import {
   parseMogrtXmlMaskPath,
   findGaussianBlurMaskTuples,
@@ -508,11 +508,14 @@ export const updateXmlMaskPathsOrAdd = async (
   }
 
   // Get ticks per frame from Premiere
-  const timeInfo = await evalTS("getCTITicksAndTicksPerFrame");
-  if (typeof timeInfo === "string") {
-    throw new Error(`Failed to get CTI time info: ${timeInfo}`);
+  const timeInfo = await evalTSResult("getCTITicksAndTicksPerFrame");
+  if (!timeInfo.ok) {
+    throw new Error(`Failed to get CTI time info: ${timeInfo.error}`);
   }
-  const { ticksPerFrame } = timeInfo;
+  if (typeof timeInfo.data === "string") {
+    throw new Error(`Failed to get CTI time info: ${timeInfo.data}`);
+  }
+  const { ticksPerFrame } = timeInfo.data;
 
   const existing = findGaussianBlurMaskTuples(xmlDoc);
   const componentsContainer = getVideoComponentChainComponents(xmlDoc);
@@ -827,7 +830,7 @@ export const buildAndImportMogrtFromTracks = async (
     const modifiedXmlPath = await updateXmlMaskPathsOrAdd(xmlFilePath, specs);
     const tempDir = os.tmpdir();
     const mogrtPath = await buildMogrtFile(modifiedXmlPath, tempDir);
-    const importResult = await evalTS(
+    const importResult = await evalTSResult(
       "importModifiedMogrt",
       mogrtPath,
       opts.timeInTicks,
@@ -835,7 +838,10 @@ export const buildAndImportMogrtFromTracks = async (
       opts.videoTrackOffset ?? 1,
       opts.audioTrackOffset ?? 0
     );
-    return `MOGRT built and imported successfully.\nBuild: ${mogrtPath}\nImport: ${importResult}`;
+    const importMessage = importResult.ok
+      ? String(importResult.data)
+      : importResult.error;
+    return `MOGRT built and imported successfully.\nBuild: ${mogrtPath}\nImport: ${importMessage}`;
   } catch (e: any) {
     return `Error in buildAndImportMogrtFromTracks: ${e instanceof Error ? e.message : String(e)}`;
   }
@@ -930,7 +936,7 @@ export const buildAndImportMogrtMulti = async (
     const mogrtPath = await buildMogrtFile(modifiedXmlPath, tempDir);
 
     // Import
-    const importResult = await evalTS(
+    const importResult = await evalTSResult(
       "importModifiedMogrt",
       mogrtPath,
       timeInTicks,
@@ -939,7 +945,10 @@ export const buildAndImportMogrtMulti = async (
       audioTrackOffset
     );
 
-    return `MOGRT built and imported successfully.\nBuild: ${mogrtPath}\nImport: ${importResult}`;
+    const importMessage = importResult.ok
+      ? String(importResult.data)
+      : importResult.error;
+    return `MOGRT built and imported successfully.\nBuild: ${mogrtPath}\nImport: ${importMessage}`;
   } catch (e: any) {
     return `Error in buildAndImportMogrtMulti: ${e instanceof Error ? e.message : String(e)}`;
   }
@@ -994,7 +1003,7 @@ export const buildAndImportMogrt = async (
     console.log(
       "[buildAndImportMogrt] Step 2: Importing MOGRT into Premiere Pro..."
     );
-    const importResult = await evalTS(
+    const importResult = await evalTSResult(
       "importModifiedMogrt",
       mogrtPath,
       timeInTicks,
@@ -1004,7 +1013,10 @@ export const buildAndImportMogrt = async (
     );
 
     console.log("[buildAndImportMogrt] Pipeline completed");
-    return `MOGRT built and imported successfully.\nBuild: ${mogrtPath}\nImport: ${importResult}`;
+    const importMessage = importResult.ok
+      ? String(importResult.data)
+      : importResult.error;
+    return `MOGRT built and imported successfully.\nBuild: ${mogrtPath}\nImport: ${importMessage}`;
   } catch (error: any) {
     const errorMsg = `Error in buildAndImportMogrt: ${error instanceof Error ? error.message : String(error)}`;
     console.error("[buildAndImportMogrt]", errorMsg);

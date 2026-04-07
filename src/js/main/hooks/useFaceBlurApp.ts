@@ -1,28 +1,33 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { subscribeBackgroundColor } from "../../lib/utils/bolt";
-import { buildAndImportMogrtFromTracks } from "../../lib/utils/mogrt";
-import { evalTS } from "../../lib/utils/bolt";
 import type { MaskPoint } from "../../lib/utils/mogrt/encoder";
-import { fs, os, path } from "../../lib/cep/node";
+import { fs, path } from "../../lib/cep/node";
 import {
-  bboxToMaskPoints,
   cancelFacePipeline,
-  runFacePipeline,
   type FaceTrack,
 } from "../../lib/utils/faceDetection";
 import { toast } from "sonner";
 import type {
   UIMask,
   Dimensions,
-  SegmentDescriptor,
   MarkerPayload,
-  MarkerMaskPayload,
   LoadedSegmentState,
   BatchJobState,
 } from "../types";
 import { usePipelineEvents } from "./usePipelineEvents";
 import { useCanvas, isPointInPolygon } from "./useCanvas";
 import { isBetaLocked } from "../lib/betaGate";
+import {
+  applyMasksToTimeline,
+  runBatchFaceDetection,
+  syncPanelStateFromPremiere,
+} from "./faceBlurWorkflows";
+import {
+  getMaskPointsAtFrame,
+  markerMasksToUiMasks,
+  uiMasksToMarkerMasks,
+} from "../lib/maskTransforms";
+import { upsertSegmentMarker } from "../lib/pproClient";
 
 const POINT_HIT_THRESHOLD = 10;
 const ADJUSTMENT_LAYER_REMINDER =
@@ -35,58 +40,6 @@ function maskHasAnyValidShape(mask: UIMask): boolean {
     return Object.values(mask.keyframes).some((pts) => pts.length >= 3);
   }
   return mask.points.length >= 3;
-}
-
-function getMaskPointsAtFrame(mask: UIMask, frameIndex: number): MaskPoint[] {
-  if (mask.keyframes) {
-    if (mask.keyframes[frameIndex]) return mask.keyframes[frameIndex];
-    return [];
-  }
-  return mask.points;
-}
-
-function faceTracksToMasks(tracks: FaceTrack[]): UIMask[] {
-  return tracks.map((track, idx) => {
-    const keyframes: Record<number, MaskPoint[]> = {};
-    track.frames.forEach((frame) => {
-      keyframes[frame.frameIndex] = bboxToMaskPoints(frame.bbox);
-    });
-    const first =
-      track.frames.find((frame) => frame.frameIndex === 0) ?? track.frames[0];
-    return {
-      id: `track_${track.id}`,
-      name: `Person ${idx + 1}`,
-      points: first ? bboxToMaskPoints(first.bbox) : [],
-      blurriness: 50,
-      feather: 10,
-      expansion: 0,
-      keyframes,
-    };
-  });
-}
-
-function markerMasksToUiMasks(markerMasks: MarkerMaskPayload[]): UIMask[] {
-  return markerMasks.map((mask) => ({
-    id: mask.id,
-    name: mask.name,
-    points: mask.points ?? [],
-    blurriness: mask.blurriness,
-    feather: mask.feather,
-    expansion: mask.expansion,
-    keyframes: mask.keyframes ?? {},
-  }));
-}
-
-function uiMasksToMarkerMasks(masks: UIMask[]): MarkerMaskPayload[] {
-  return masks.map((mask) => ({
-    id: mask.id,
-    name: mask.name,
-    points: mask.points,
-    blurriness: mask.blurriness ?? 50,
-    feather: mask.feather ?? 10,
-    expansion: mask.expansion ?? 0,
-    keyframes: mask.keyframes ?? {},
-  }));
 }
 
 export function useFaceBlurApp() {
@@ -446,13 +399,13 @@ export function useFaceBlurApp() {
         createdAt: now,
         updatedAt: now,
       };
-      const upsertResult = await evalTS("upsertSegmentMarker", payload);
-      if (typeof upsertResult !== "string") {
+      const upsertResult = await upsertSegmentMarker(payload);
+      if (upsertResult.ok) {
         setLoadedSegment((prev) =>
           prev
             ? {
                 ...prev,
-                markerGuid: upsertResult.markerGuid,
+                markerGuid: upsertResult.data.markerGuid,
               }
             : prev,
         );
@@ -631,277 +584,80 @@ export function useFaceBlurApp() {
   }, [isDragging]);
 
   const handleLoadAndRenderSequence = useCallback(async () => {
-    if (isBetaLocked()) {
-      notifyWarning("Face Blur beta has ended. This panel is locked.");
-      return;
-    }
-
-    try {
-      detectAbortRef.current.cancelled = false;
-      setPipelineStatusMessage("Reading selected clips…");
-      setBatchJob({ running: true, totalSegments: 0, completedSegments: 0 });
-      setIsRendering(true);
-
-      const rawSegments = await evalTS("getSelectedClipSegments");
-      if (typeof rawSegments === "string") {
-        setPipelineStatusMessage(rawSegments);
-        return;
-      }
-      if (!Array.isArray(rawSegments) || rawSegments.length === 0) {
-        setPipelineStatusMessage("No selected clips found.");
-        return;
-      }
-      const segments = rawSegments as SegmentDescriptor[];
-      setBatchJob({
-        running: true,
-        totalSegments: segments.length,
-        completedSegments: 0,
-      });
-
-      for (let i = 0; i < segments.length; i++) {
-        if (detectAbortRef.current.cancelled) {
-          throw new Error("Cancelled.");
-        }
-        const segment = segments[i];
-        const label = `${i + 1}/${segments.length}`;
-        const safeSegmentId = segment.segmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const folder = path.join(
-          os.tmpdir(),
-          `face_blur_seg_${safeSegmentId}_${Date.now().toString(36)}`,
-        );
-        if (!fs.existsSync(folder)) fs.mkdirSync(folder);
-
-        setIsRendering(true);
-        setIsDetectingFaces(false);
-        setPipelineStatusMessage(
-          `Rendering segment ${label} (${segment.numFrames} frames)…`,
-        );
-        const renderResult = await evalTS(
-          "exportSegmentAsImageSequence",
-          segment,
-          folder,
-        );
-        if (typeof renderResult === "string") {
-          throw new Error(`Segment ${label} render failed: ${renderResult}`);
-        }
-
-        const pngs = readPngSequence(renderResult.outputDir);
-        if (pngs.length === 0) {
-          throw new Error(`Segment ${label} rendered no frames.`);
-        }
-
-        setIsRendering(false);
-        setIsDetectingFaces(true);
-        setPipelineStatusMessage(`Detecting faces in segment ${label}…`);
-        const pipelineResult = await runFacePipeline(pngs, {
-          confThresh: confidenceThreshold,
-          videoFps: 30.0,
-          detectionFps: 5.0,
-        });
-
-        if (detectAbortRef.current.cancelled) {
-          throw new Error("Cancelled.");
-        }
-
-        const generatedMasks = faceTracksToMasks(pipelineResult.tracks);
-        const now = new Date().toISOString();
-        const markerPayload: MarkerPayload = {
-          kind: "face-blur-segment",
-          schemaVersion: 1,
-          segment,
-          pngDir: renderResult.outputDir,
-          masks: uiMasksToMarkerMasks(generatedMasks),
-          createdAt: now,
-          updatedAt: now,
-        };
-        const markerResult = await evalTS("upsertSegmentMarker", markerPayload);
-        if (typeof markerResult === "string") {
-          throw new Error(
-            `Segment ${label} marker write failed: ${markerResult}`,
-          );
-        }
-
-        if (i === segments.length - 1) {
-          loadPayloadIntoPanel(markerResult.markerGuid, markerPayload, pngs);
-          setFaceTracks(pipelineResult.tracks);
-        }
-
-        setBatchJob({
-          running: true,
-          totalSegments: segments.length,
-          completedSegments: i + 1,
-        });
-      }
-      notifySuccess(`Batch complete. Processed ${segments.length} segment(s).`);
-    } catch (e: unknown) {
-      notifyError(`Error: ${e instanceof Error ? e.message : String(e)}`);
-      setFaceTracks(null);
-    } finally {
-      setPipelineStatusMessage("");
-      setBatchJob((prev) => ({ ...prev, running: false }));
-      setIsRendering(false);
-      setIsDetectingFaces(false);
-    }
-  }, [confidenceThreshold, loadPayloadIntoPanel, notifyError, notifySuccess, readPngSequence]);
-
-  const handleApplyMasks = useCallback(async () => {
-    if (!loadedSegment) {
-      notifyWarning("Load a segment marker first.");
-      return;
-    }
-    const segment = loadedSegment.segment;
-
-    if (masks.length > 0 && masks.some((m) => m.keyframes)) {
-      try {
-        notifyInfo("Building and importing MOGRT from edited masks…");
-        const trackSpecs = masks
-          .filter((m) => m.keyframes && Object.keys(m.keyframes).length > 0)
-          .map((m) => {
-            const frames = Object.keys(m.keyframes!)
-              .map((frameStr) => ({
-                frameIndex: Number(frameStr),
-                points: m.keyframes![Number(frameStr)],
-              }))
-              .sort((a, b) => a.frameIndex - b.frameIndex);
-            return {
-              frames,
-              blurriness: m.blurriness ?? 50,
-              feather: m.feather ?? 10,
-              expansion: m.expansion ?? 0,
-            };
-          });
-
-        if (trackSpecs.length === 0) {
-          notifyWarning("No masks with keyframes found.");
-          return;
-        }
-
-        const res = await buildAndImportMogrtFromTracks(trackSpecs, {
-          ticksPerFrame: segment.ticksPerFrame,
-          timeInTicks: segment.startTicks,
-          endTicks: segment.endTicks,
-          videoTrackOffset: 1,
-          audioTrackOffset: 0,
-          numFrames:
-            framePaths.length > 0 ? framePaths.length : segment.numFrames,
-        });
-        await persistCurrentMasksToLoadedMarker();
-        notifyMogrtResult(res, "Applied edited masks to timeline.");
-        return;
-      } catch (e: unknown) {
-        notifyError(
-          `Error building from edited masks: ${e instanceof Error ? e.message : String(e)}`,
-        );
-        return;
-      }
-    }
-
-    if (faceTracks) {
-      try {
-        notifyInfo("Building and importing MOGRT from tracked faces…");
-        const trackSpecs = faceTracks.map((t) => ({
-          frames: t.frames.map((f) => ({
-            frameIndex: f.frameIndex,
-            points: bboxToMaskPoints(f.bbox),
-          })),
-          blurriness: 50,
-          feather: 10,
-          expansion: 0,
-        }));
-        const res = await buildAndImportMogrtFromTracks(trackSpecs, {
-          ticksPerFrame: segment.ticksPerFrame,
-          timeInTicks: segment.startTicks,
-          endTicks: segment.endTicks,
-          videoTrackOffset: 1,
-          audioTrackOffset: 0,
-          numFrames:
-            framePaths.length > 0 ? framePaths.length : segment.numFrames,
-        });
-        await persistCurrentMasksToLoadedMarker();
-        notifyMogrtResult(res, "Applied tracked face masks to timeline.");
-        return;
-      } catch (e: unknown) {
-        notifyError(
-          `Error building from tracks: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    }
-
-    if (masks.length === 0) {
-      notifyWarning("Please create at least one mask before applying.");
-      return;
-    }
-    if (masks.some((m) => m.points.length < 3)) {
-      notifyWarning("Each mask must have at least 3 points.");
-      return;
-    }
-    try {
-      notifyInfo("Building and importing MOGRT with multiple masks...");
-      const staticTrackSpecs = masks.map((m) => ({
-        frames: [{ frameIndex: 0, points: m.points }],
-        blurriness: m.blurriness ?? 50,
-        feather: m.feather ?? 10,
-        expansion: m.expansion ?? 0,
-      }));
-      const result = await buildAndImportMogrtFromTracks(staticTrackSpecs, {
-        ticksPerFrame: segment.ticksPerFrame,
-        timeInTicks: segment.startTicks,
-        endTicks: segment.endTicks,
-        videoTrackOffset: 1,
-        audioTrackOffset: 0,
-        numFrames:
-          framePaths.length > 0 ? framePaths.length : segment.numFrames,
-      });
-      await persistCurrentMasksToLoadedMarker();
-      notifyMogrtResult(result, "Applied masks to timeline.");
-    } catch (error: unknown) {
-      notifyError(`Error: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    await runBatchFaceDetection({
+      confidenceThreshold,
+      readPngSequence,
+      loadPayloadIntoPanel,
+      setFaceTracks,
+      setPipelineStatusMessage,
+      setBatchJob,
+      setBatchJobRunningDone: () =>
+        setBatchJob((prev) => ({ ...prev, running: false })),
+      setIsRendering,
+      setIsDetectingFaces,
+      detectAbortRef,
+      notify: {
+        info: notifyInfo,
+        success: notifySuccess,
+        warning: notifyWarning,
+        error: notifyError,
+        mogrtResult: notifyMogrtResult,
+      },
+      isBetaLocked: isBetaLocked(),
+    });
   }, [
-    masks,
-    faceTracks,
-    loadedSegment,
-    framePaths.length,
+    confidenceThreshold,
+    loadPayloadIntoPanel,
     notifyError,
     notifyInfo,
     notifyMogrtResult,
+    notifySuccess,
+    notifyWarning,
+    readPngSequence,
+  ]);
+
+  const handleApplyMasks = useCallback(async () => {
+    await applyMasksToTimeline({
+      loadedSegment,
+      masks,
+      faceTracks,
+      frameCount: framePaths.length,
+      currentFrameIndex,
+      persistCurrentMasksToLoadedMarker: async () => {
+        await persistCurrentMasksToLoadedMarker();
+      },
+      notify: {
+        info: notifyInfo,
+        success: notifySuccess,
+        warning: notifyWarning,
+        error: notifyError,
+        mogrtResult: notifyMogrtResult,
+      },
+    });
+  }, [
+    currentFrameIndex,
+    faceTracks,
+    framePaths.length,
+    loadedSegment,
+    masks,
+    notifyError,
+    notifyInfo,
+    notifyMogrtResult,
+    notifySuccess,
     notifyWarning,
     persistCurrentMasksToLoadedMarker,
   ]);
 
   const handlePanelMouseEnter = useCallback(async () => {
-    const selectedSegments = await evalTS("getSelectedClipSegments");
-    if (
-      typeof selectedSegments === "string" ||
-      !Array.isArray(selectedSegments)
-    ) {
-      setSelectedClipCount(0);
-    } else {
-      setSelectedClipCount(selectedSegments.length);
-    }
-
-    if (batchJob.running || isRendering || isDetectingFaces) return;
-    const markerAtCti = await evalTS("findOwnedMarkerAtCTI");
-    if (typeof markerAtCti === "string") {
-      return;
-    }
-    if (!markerAtCti?.found) {
-      resetLoadedPanelState();
-      return;
-    }
-
-    const payload = markerAtCti.payload as MarkerPayload;
-    if (!payload || payload.kind !== "face-blur-segment") return;
-    if (payload.schemaVersion !== 1 || !payload.segment) return;
-    if (
-      loadedSegment &&
-      (loadedSegment.markerGuid === markerAtCti.markerGuid ||
-        loadedSegment.segment.segmentId === payload.segment.segmentId)
-    ) {
-      return;
-    }
-
-    loadPayloadIntoPanel(markerAtCti.markerGuid, payload);
+    await syncPanelStateFromPremiere({
+      batchRunning: batchJob.running,
+      isRendering,
+      isDetectingFaces,
+      loadedSegment,
+      setSelectedClipCount,
+      resetLoadedPanelState,
+      loadPayloadIntoPanel,
+    });
   }, [
     batchJob.running,
     isRendering,

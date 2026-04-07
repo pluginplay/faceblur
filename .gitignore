@@ -11,6 +11,9 @@ yarn-error.log
 # -----------------------------------------------------------------------------
 _generated/
 .tmp/
+tmp_models/
+tmp_frames/
+tmp_output/
 tracking_output.json
 pipeline_output.txt
 raw_tracking_data.json

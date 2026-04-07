@@ -1,4 +1,5 @@
-const DEFAULT_BETA_EXPIRES_AT_ISO = "2026-04-01T00:00:00Z";
+// UTC midnight when the panel locks unless VITE_BETA_EXPIRES_AT is set at build time.
+const DEFAULT_BETA_EXPIRES_AT_ISO = "2026-05-07T00:00:00Z";
 
 export const BETA_EXPIRES_AT_ISO =
   import.meta.env.VITE_BETA_EXPIRES_AT ?? DEFAULT_BETA_EXPIRES_AT_ISO;

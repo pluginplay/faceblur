@@ -1,13 +1,14 @@
 {
   "name": "pluginplay.faceblur",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "watch": "tsc && vite build --watch true",
+    "check:repo:hygiene": "node scripts/check-repo-hygiene.mjs",
     "check:native:build": "node scripts/check-native-for-build.mjs",
-    "prebuild": "yarn check:native:build",
+    "prebuild": "yarn check:repo:hygiene && yarn check:native:build",
     "build": "rimraf dist/* && tsc -p \"tsconfig-build.json\" && vite build --watch false",
     "build:mac": "yarn native:mac && yarn build",
     "build:win": "node scripts/build-native-windows.mjs",
