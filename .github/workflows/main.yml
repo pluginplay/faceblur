@@ -13,9 +13,31 @@ defaults:
     shell: bash
 
 jobs:
+  # ── Gate: only release from commits reachable on main ──────────────
+  guard:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Tag ${{ github.ref_name }} does not point to a commit on main — skipping release."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── macOS native build ─────────────────────────────────────────────
   build_native_macos:
     name: Build native (macOS)
     runs-on: macos-latest
+    needs: guard
+    if: needs.guard.outputs.allowed == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,6 +71,7 @@ jobs:
         run: node scripts/verify-native-bundle.mjs --target macos --bin-dir native_out/macos --skip-models
 
       - name: Sign native payload (macOS)
+        if: env.MAC_CODESIGN_IDENTITY != ''
         env:
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
           MAC_CODESIGN_ENTITLEMENTS: scripts/macos-native.entitlements
@@ -57,6 +80,7 @@ jobs:
           scripts/sign-macos-native.sh native_out/macos
 
       - name: Notarize native payload (macOS)
+        if: env.MAC_NOTARY_APPLE_ID != '' || env.MAC_NOTARY_KEYCHAIN_PROFILE != ''
         env:
           MAC_NOTARY_KEYCHAIN_PROFILE: ${{ secrets.MAC_NOTARY_KEYCHAIN_PROFILE }}
           MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
@@ -71,9 +95,12 @@ jobs:
           name: native-macos
           path: native_out/macos/**
 
+  # ── Windows native build ───────────────────────────────────────────
   build_native_windows:
     name: Build native (Windows)
     runs-on: windows-latest
+    needs: guard
+    if: needs.guard.outputs.allowed == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,6 +141,7 @@ jobs:
         run: node scripts/verify-native-bundle.mjs --target windows --bin-dir native_out/windows --skip-models
 
       - name: Sign native payload (Windows)
+        if: env.WIN_SIGN_PFX_BASE64 != ''
         shell: powershell
         env:
           WIN_SIGN_PFX_BASE64: ${{ secrets.WIN_SIGN_PFX_BASE64 }}
@@ -126,6 +154,7 @@ jobs:
           name: native-windows
           path: native_out/windows/**
 
+  # ── Package ZXP + GitHub Release ───────────────────────────────────
   package_zxp:
     name: Package ZXP (macOS)
     runs-on: macos-latest
