@@ -1,6 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
-import type { Dimensions } from "../types";
+import type { Dimensions, TimelineViewport } from "../types";
+import {
+  clampTimelineViewport,
+  createFullTimelineViewport,
+  ensureFrameVisibleInTimelineViewport,
+  getTimelineMinimumVisibleSpan,
+  getTotalFrameIndex,
+} from "../lib/timelineViewport";
 import { Scrubber } from "./Scrubber";
 
 interface FramePreviewProps {
@@ -22,6 +29,12 @@ interface FramePreviewProps {
   currentFrameIndex: number;
   isPlaying: boolean;
   activeMaskFrameSegments: { startFrameIndex: number; endFrameIndex: number }[];
+  activeMaskKeyframeFrames: number[];
+  selectedKeyframeFrames: number[];
+  onSelectedKeyframeFramesChange: (frameIndices: number[]) => void;
+  onDeleteSelectedKeyframes: () => void;
+  onMoveSelectedKeyframes: () => void;
+  canMoveSelectedKeyframes: boolean;
   onFrameChange: (index: number) => void;
   onPlayPause: () => void;
 }
@@ -45,6 +58,12 @@ export function FramePreview({
   currentFrameIndex,
   isPlaying,
   activeMaskFrameSegments,
+  activeMaskKeyframeFrames,
+  selectedKeyframeFrames,
+  onSelectedKeyframeFramesChange,
+  onDeleteSelectedKeyframes,
+  onMoveSelectedKeyframes,
+  canMoveSelectedKeyframes,
   onFrameChange,
   onPlayPause,
 }: FramePreviewProps) {
@@ -54,6 +73,17 @@ export function FramePreview({
   const [isSpacePressed, setIsSpacePressed] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
   const [stageDimensions, setStageDimensions] = useState<Dimensions | null>(null);
+  const totalFrameIndex = useMemo(
+    () => getTotalFrameIndex(framePathsLength),
+    [framePathsLength],
+  );
+  const minimumVisibleSpan = useMemo(
+    () => getTimelineMinimumVisibleSpan(totalFrameIndex, playbackFps),
+    [totalFrameIndex, playbackFps],
+  );
+  const [timelineViewport, setTimelineViewport] = useState<TimelineViewport>(() =>
+    createFullTimelineViewport(totalFrameIndex),
+  );
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const panStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const zoomModifierKey =
@@ -165,6 +195,14 @@ export function FramePreview({
         target?.tagName === "BUTTON" ||
         target?.isContentEditable;
       if (isTypingContext) return;
+      if (
+        selectedKeyframeFrames.length > 0 &&
+        (event.key === "Delete" || event.key === "Backspace")
+      ) {
+        event.preventDefault();
+        onDeleteSelectedKeyframes();
+        return;
+      }
       if (event.code === "Space") setIsSpacePressed(true);
     };
     const onKeyUp = (event: KeyboardEvent) => {
@@ -179,11 +217,50 @@ export function FramePreview({
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, []);
+  }, [onDeleteSelectedKeyframes, selectedKeyframeFrames.length]);
 
   useEffect(() => {
     resetZoom();
   }, [previewSequenceId, resetZoom]);
+
+  useEffect(() => {
+    setTimelineViewport(createFullTimelineViewport(totalFrameIndex));
+  }, [previewSequenceId]);
+
+  useEffect(() => {
+    setTimelineViewport((prev) => {
+      const next = clampTimelineViewport(
+        prev,
+        totalFrameIndex,
+        minimumVisibleSpan,
+      );
+      if (
+        next.startFrameIndex === prev.startFrameIndex &&
+        next.endFrameIndex === prev.endFrameIndex
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [minimumVisibleSpan, totalFrameIndex]);
+
+  useEffect(() => {
+    setTimelineViewport((prev) => {
+      const next = ensureFrameVisibleInTimelineViewport(
+        prev,
+        currentFrameIndex,
+        totalFrameIndex,
+        minimumVisibleSpan,
+      );
+      if (
+        next.startFrameIndex === prev.startFrameIndex &&
+        next.endFrameIndex === prev.endFrameIndex
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [currentFrameIndex, minimumVisibleSpan, totalFrameIndex]);
 
   useEffect(() => {
     if (!disableViewportTransforms) return;
@@ -267,21 +344,25 @@ export function FramePreview({
     setIsPanning(false);
   }, []);
 
-  const handleZoomIn = useCallback(() => {
-    if (disableViewportTransforms) return;
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    const rect = viewport.getBoundingClientRect();
-    applyZoomAtClientPoint(1.2, rect.left + rect.width / 2, rect.top + rect.height / 2);
-  }, [disableViewportTransforms, applyZoomAtClientPoint]);
-
-  const handleZoomOut = useCallback(() => {
-    if (disableViewportTransforms) return;
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    const rect = viewport.getBoundingClientRect();
-    applyZoomAtClientPoint(1 / 1.2, rect.left + rect.width / 2, rect.top + rect.height / 2);
-  }, [disableViewportTransforms, applyZoomAtClientPoint]);
+  const handleVisibleRangeChange = useCallback(
+    (nextViewport: TimelineViewport) => {
+      setTimelineViewport((prev) => {
+        const next = clampTimelineViewport(
+          nextViewport,
+          totalFrameIndex,
+          minimumVisibleSpan,
+        );
+        if (
+          next.startFrameIndex === prev.startFrameIndex &&
+          next.endFrameIndex === prev.endFrameIndex
+        ) {
+          return prev;
+        }
+        return next;
+      });
+    },
+    [minimumVisibleSpan, totalFrameIndex],
+  );
 
   return (
     <div
@@ -397,13 +478,18 @@ export function FramePreview({
             currentFrameIndex={currentFrameIndex}
             playbackFps={playbackFps}
             isPlaying={isPlaying}
+            visibleStartFrameIndex={timelineViewport.startFrameIndex}
+            visibleEndFrameIndex={timelineViewport.endFrameIndex}
             activeMaskFrameSegments={activeMaskFrameSegments}
-            zoomLevel={zoomLevel}
+            activeMaskKeyframeFrames={activeMaskKeyframeFrames}
+            selectedKeyframeFrames={selectedKeyframeFrames}
+            onSelectedKeyframeFramesChange={onSelectedKeyframeFramesChange}
+            onDeleteSelectedKeyframes={onDeleteSelectedKeyframes}
+            onMoveSelectedKeyframes={onMoveSelectedKeyframes}
+            canMoveSelectedKeyframes={canMoveSelectedKeyframes}
             onFrameChange={onFrameChange}
+            onVisibleRangeChange={handleVisibleRangeChange}
             onPlayPause={onPlayPause}
-            onZoomIn={handleZoomIn}
-            onZoomOut={handleZoomOut}
-            onZoomReset={resetZoom}
           />
         </div>
       )}
