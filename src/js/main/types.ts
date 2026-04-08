@@ -15,6 +15,11 @@ export interface Dimensions {
   height: number;
 }
 
+export interface TimelineViewport {
+  startFrameIndex: number;
+  endFrameIndex: number;
+}
+
 export interface SegmentDescriptor {
   segmentId: string;
   startTicks: string;
