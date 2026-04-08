@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useFaceBlurApp } from "./hooks";
 import {
   FramePreview,
   ActionButtons,
   HelpGuideDialog,
   WelcomeDialog,
+  MoveKeyframesDialog,
 } from "./components";
 import { MaskList } from "./components/MaskList";
 import {
@@ -64,6 +65,12 @@ export function App() {
   const [isTracksCollapsed, setIsTracksCollapsed] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isWelcomeOpen, setIsWelcomeOpen] = useState(false);
+  const [selectedKeyframeFrames, setSelectedKeyframeFrames] = useState<number[]>(
+    [],
+  );
+  const [isMoveDialogOpen, setIsMoveDialogOpen] = useState(false);
+  const [moveSourceMaskId, setMoveSourceMaskId] = useState<string | null>(null);
+  const [moveTargetMaskId, setMoveTargetMaskId] = useState<string | null>(null);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("faceblur:tracks-collapsed");
@@ -99,6 +106,14 @@ export function App() {
     () => buildActiveMaskFrameSegments(activeMask, totalFrameIndex),
     [activeMask, totalFrameIndex],
   );
+  const activeMaskKeyframeFrames = useMemo(() => {
+    if (!activeMask?.keyframes || totalFrameIndex < 0) return [];
+    const frames = Object.keys(activeMask.keyframes)
+      .map((frameStr) => Number(frameStr))
+      .filter((frame) => Number.isFinite(frame))
+      .map((frame) => Math.max(0, Math.min(totalFrameIndex, frame)));
+    return [...new Set(frames)].sort((a, b) => a - b);
+  }, [activeMask, totalFrameIndex]);
   const canApply = useMemo(
     () =>
       app.masks.length > 0 &&
@@ -106,6 +121,85 @@ export function App() {
     [app.masks, app.maskHasAnyValidShape],
   );
   const previewSequenceId = app.loadedSegment?.markerGuid ?? "";
+  const deleteActiveMaskKeyframes = app.deleteActiveMaskKeyframes;
+  const moveMaskKeyframes = app.moveMaskKeyframes;
+  const moveSourceMask = useMemo(
+    () => app.masks.find((m) => m.id === moveSourceMaskId) ?? null,
+    [app.masks, moveSourceMaskId],
+  );
+  const destinationMasks = useMemo(
+    () => app.masks.filter((m) => m.id !== moveSourceMaskId),
+    [app.masks, moveSourceMaskId],
+  );
+  const canMoveSelectedKeyframes =
+    selectedKeyframeFrames.length > 0 && app.masks.length > 1;
+
+  useEffect(() => {
+    setSelectedKeyframeFrames([]);
+  }, [activeMask?.id, previewSequenceId]);
+
+  const resetMoveDialog = useCallback(() => {
+    setIsMoveDialogOpen(false);
+    setMoveSourceMaskId(null);
+    setMoveTargetMaskId(null);
+  }, []);
+
+  useEffect(() => {
+    setSelectedKeyframeFrames((prev) => {
+      if (prev.length === 0) return prev;
+      const validFrames = new Set(activeMaskKeyframeFrames);
+      const next = prev.filter((frameIndex) => validFrames.has(frameIndex));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [activeMaskKeyframeFrames]);
+
+  useEffect(() => {
+    if (!isMoveDialogOpen) return;
+    if (!moveSourceMask || destinationMasks.length === 0) {
+      resetMoveDialog();
+      return;
+    }
+    if (
+      moveTargetMaskId &&
+      !destinationMasks.some((mask) => mask.id === moveTargetMaskId)
+    ) {
+      setMoveTargetMaskId(null);
+    }
+  }, [
+    destinationMasks,
+    isMoveDialogOpen,
+    moveSourceMask,
+    moveTargetMaskId,
+    resetMoveDialog,
+  ]);
+
+  const handleDeleteSelectedKeyframes = useCallback(() => {
+    if (selectedKeyframeFrames.length === 0) return;
+    deleteActiveMaskKeyframes(selectedKeyframeFrames);
+    setSelectedKeyframeFrames([]);
+  }, [deleteActiveMaskKeyframes, selectedKeyframeFrames]);
+
+  const handleOpenMoveDialog = useCallback(() => {
+    if (!activeMask?.id || !canMoveSelectedKeyframes) return;
+    setMoveSourceMaskId(activeMask.id);
+    setMoveTargetMaskId(null);
+    setIsMoveDialogOpen(true);
+  }, [activeMask?.id, canMoveSelectedKeyframes]);
+
+  const handleConfirmMoveKeyframes = useCallback(() => {
+    if (!moveSourceMaskId || !moveTargetMaskId || selectedKeyframeFrames.length === 0) {
+      return;
+    }
+    moveMaskKeyframes(moveSourceMaskId, moveTargetMaskId, selectedKeyframeFrames);
+    setSelectedKeyframeFrames([]);
+    resetMoveDialog();
+  }, [
+    moveMaskKeyframes,
+    moveSourceMaskId,
+    moveTargetMaskId,
+    resetMoveDialog,
+    selectedKeyframeFrames,
+  ]);
 
   const handleDismissWelcome = () => {
     markWelcomeDialogSeen({ version: WELCOME_DIALOG_VERSION });
@@ -230,6 +324,12 @@ export function App() {
               currentFrameIndex={app.currentFrameIndex}
               isPlaying={app.isPlaying}
               activeMaskFrameSegments={activeMaskFrameSegments}
+              activeMaskKeyframeFrames={activeMaskKeyframeFrames}
+              selectedKeyframeFrames={selectedKeyframeFrames}
+              onSelectedKeyframeFramesChange={setSelectedKeyframeFrames}
+              onDeleteSelectedKeyframes={handleDeleteSelectedKeyframes}
+              onMoveSelectedKeyframes={handleOpenMoveDialog}
+              canMoveSelectedKeyframes={canMoveSelectedKeyframes}
               onFrameChange={(v) => {
                 app.setCurrentFrameIndex(v);
                 app.setIsPlaying(false);
@@ -250,6 +350,17 @@ export function App() {
         panelBgColor={app.bgColor}
         onDismiss={handleDismissWelcome}
         onContinueToDocumentation={handleContinueToDocumentation}
+      />
+      <MoveKeyframesDialog
+        open={isMoveDialogOpen}
+        panelBgColor={app.bgColor}
+        sourceMask={moveSourceMask}
+        destinationMasks={destinationMasks}
+        selectedTargetMaskId={moveTargetMaskId}
+        selectedKeyframeCount={selectedKeyframeFrames.length}
+        onSelectedTargetMaskIdChange={setMoveTargetMaskId}
+        onConfirm={handleConfirmMoveKeyframes}
+        onCancel={resetMoveDialog}
       />
     </div>
   );

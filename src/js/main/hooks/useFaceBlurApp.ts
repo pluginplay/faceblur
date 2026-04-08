@@ -42,6 +42,10 @@ function maskHasAnyValidShape(mask: UIMask): boolean {
   return mask.points.length >= 3;
 }
 
+function cloneMaskPoints(points: MaskPoint[]): MaskPoint[] {
+  return points.map((point) => ({ ...point }));
+}
+
 export function useFaceBlurApp() {
   const [bgColor, setBgColor] = useState("#282c34");
   const [pipelineStatusMessage, setPipelineStatusMessage] = useState("");
@@ -817,6 +821,123 @@ export function useFaceBlurApp() {
     [activeMaskId, commitMaskChange],
   );
 
+  const deleteActiveMaskKeyframes = useCallback(
+    (frameIndices: number[]) => {
+      if (!activeMaskId || frameIndices.length === 0) return;
+      const framesToDelete = new Set(
+        frameIndices
+          .map((frameIndex) => Math.floor(frameIndex))
+          .filter((frameIndex) => Number.isFinite(frameIndex)),
+      );
+      if (framesToDelete.size === 0) return;
+
+      commitMaskChange((prev) => {
+        let didChange = false;
+        const next = prev.map((mask) => {
+          if (mask.id !== activeMaskId || !mask.keyframes) return mask;
+
+          const nextKeyframes: Record<number, MaskPoint[]> = {};
+          Object.keys(mask.keyframes).forEach((frameStr) => {
+            const frameIndex = Number(frameStr);
+            if (framesToDelete.has(frameIndex)) {
+              didChange = true;
+              return;
+            }
+            nextKeyframes[frameIndex] = mask.keyframes![frameIndex];
+          });
+
+          if (!didChange) return mask;
+          const updated = { ...mask, keyframes: nextKeyframes };
+          return {
+            ...updated,
+            points: getMaskPointsAtFrame(updated, currentFrameIndex),
+          };
+        });
+
+        return didChange ? next : prev;
+      });
+      setSelectedPointIndex(null);
+    },
+    [activeMaskId, commitMaskChange, currentFrameIndex],
+  );
+
+  const moveMaskKeyframes = useCallback(
+    (sourceMaskId: string, targetMaskId: string, frameIndices: number[]) => {
+      if (!sourceMaskId || !targetMaskId || frameIndices.length === 0) return;
+      if (sourceMaskId === targetMaskId) {
+        notifyWarning("Choose a different destination track.");
+        return;
+      }
+
+      const framesToMove = [...new Set(
+        frameIndices
+          .map((frameIndex) => Math.floor(frameIndex))
+          .filter((frameIndex) => Number.isFinite(frameIndex)),
+      )].sort((a, b) => a - b);
+      if (framesToMove.length === 0) return;
+
+      commitMaskChange((prev) => {
+        const source = prev.find((mask) => mask.id === sourceMaskId);
+        const target = prev.find((mask) => mask.id === targetMaskId);
+        if (!source || !target) {
+          notifyWarning("Cannot move keyframes: track not found.");
+          return prev;
+        }
+        if (!source.keyframes || Object.keys(source.keyframes).length === 0) {
+          notifyWarning("Cannot move keyframes: source track has no keyframes.");
+          return prev;
+        }
+
+        const nextSourceKeyframes: Record<number, MaskPoint[]> = {
+          ...source.keyframes,
+        };
+        const nextTargetKeyframes: Record<number, MaskPoint[]> = {
+          ...(target.keyframes ?? {}),
+        };
+        let movedCount = 0;
+
+        framesToMove.forEach((frameIndex) => {
+          const points = nextSourceKeyframes[frameIndex];
+          if (!points) return;
+          nextTargetKeyframes[frameIndex] = cloneMaskPoints(points);
+          delete nextSourceKeyframes[frameIndex];
+          movedCount += 1;
+        });
+
+        if (movedCount === 0) {
+          notifyWarning("No matching keyframes found to move.");
+          return prev;
+        }
+
+        const nextMasks = prev.map((mask) => {
+          if (mask.id === sourceMaskId) {
+            const updated = { ...mask, keyframes: nextSourceKeyframes };
+            return {
+              ...updated,
+              points: getMaskPointsAtFrame(updated, currentFrameIndex),
+            };
+          }
+          if (mask.id === targetMaskId) {
+            const updated = { ...mask, keyframes: nextTargetKeyframes };
+            return {
+              ...updated,
+              points: getMaskPointsAtFrame(updated, currentFrameIndex),
+            };
+          }
+          return mask;
+        });
+
+        setActiveMaskId(targetMaskId);
+        setSelectedPointIndex(null);
+        notifySuccess(
+          `Moved ${movedCount} keyframe${movedCount === 1 ? "" : "s"} from ${source.name} to ${target.name}.`,
+        );
+        return nextMasks;
+      });
+    },
+    [commitMaskChange, currentFrameIndex, notifySuccess, notifyWarning],
+  );
+
   const handleCancel = useCallback(() => {
     detectAbortRef.current.cancelled = true;
     const cancelled = cancelFacePipeline();
@@ -887,6 +1008,8 @@ export function useFaceBlurApp() {
     splitMask,
     mergeMask,
     updateActiveMaskValue,
+    deleteActiveMaskKeyframes,
+    moveMaskKeyframes,
     setActiveMaskId,
     setSelectedPointIndex,
 

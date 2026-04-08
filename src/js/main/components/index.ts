@@ -6,3 +6,4 @@ export { MaskList } from "./MaskList";
 export { MaskProperties } from "./MaskProperties";
 export { HelpGuideDialog } from "./HelpGuideDialog";
 export { WelcomeDialog } from "./WelcomeDialog";
+export { MoveKeyframesDialog } from "./MoveKeyframesDialog";
